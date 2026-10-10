@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use super::MODERATION_BLOCKED_MESSAGE;
+use crate::moderation::MODERATION_BLOCKED_MESSAGE;
 
 #[derive(Debug, Clone)]
 pub struct BasicModerationBlock {
