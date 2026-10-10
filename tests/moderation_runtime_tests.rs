@@ -35,8 +35,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{header::CONTENT_TYPE, StatusCode, Uri};
+use axum::http::{header::CONTENT_TYPE, StatusCode as AxumStatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use reqwest::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use config::Settings;
@@ -485,7 +486,7 @@ async fn upstream_echo(
             json_body: json_body.clone(),
         });
 
-    (StatusCode::OK, Json(json!({"ok": true})))
+    (AxumStatusCode::OK, Json(json!({"ok": true})))
 }
 
 async fn spawn_proxy_server() -> String {
@@ -705,7 +706,7 @@ async fn upstream_ai_stream_hang(
     });
 
     Response::builder()
-        .status(StatusCode::OK)
+        .status(AxumStatusCode::OK)
         .header(CONTENT_TYPE, "text/event-stream")
         .body(body)
         .expect("disconnecting moderation stream response")

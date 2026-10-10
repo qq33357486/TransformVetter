@@ -30,8 +30,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::StatusCode;
+use axum::http::StatusCode as AxumStatusCode;
 use axum::response::Response;
+use reqwest::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use config::Settings;
@@ -91,7 +92,7 @@ async fn upstream_openai_responses_json_is_transformed_back_to_openai_chat() {
 #[tokio::test]
 async fn pass_through_non_stream_response_keeps_plain_text_body() {
     let upstream_base = spawn_fixed_upstream(
-        StatusCode::OK,
+        AxumStatusCode::OK,
         "text/plain; charset=utf-8",
         b"plain text body".to_vec(),
     )
@@ -128,7 +129,7 @@ async fn pass_through_non_stream_response_keeps_plain_text_body() {
     assert_eq!(
         response
             .headers()
-            .get(axum::http::header::CONTENT_TYPE)
+            .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
         Some("text/plain; charset=utf-8")
     );
@@ -2057,7 +2058,7 @@ async fn upstream_openai_responses_empty_output_keeps_empty_assistant_message_sh
 #[tokio::test]
 async fn non_json_success_response_is_wrapped_as_json_like_python() {
     let upstream_base = spawn_fixed_upstream(
-        StatusCode::OK,
+        AxumStatusCode::OK,
         "text/plain; charset=utf-8",
         b"plain text body".to_vec(),
     )
@@ -2101,7 +2102,7 @@ async fn non_json_success_response_is_wrapped_as_json_like_python() {
 #[tokio::test]
 async fn non_json_success_response_respects_declared_charset_like_python() {
     let upstream_base = spawn_fixed_upstream(
-        StatusCode::OK,
+        AxumStatusCode::OK,
         "text/plain; charset=iso-8859-1",
         b"caf\xe9".to_vec(),
     )
@@ -2184,7 +2185,7 @@ async fn successful_json_response_does_not_preserve_upstream_custom_headers_like
 #[tokio::test]
 async fn json_array_success_response_is_passed_through_when_response_transform_fails() {
     let upstream_base = spawn_fixed_upstream(
-        StatusCode::OK,
+        AxumStatusCode::OK,
         "application/json",
         br#"[{"type":"unexpected"}]"#.to_vec(),
     )
@@ -2225,7 +2226,7 @@ async fn json_array_success_response_is_passed_through_when_response_transform_f
 #[tokio::test]
 async fn json_scalar_success_response_is_passed_through_like_python() {
     let upstream_base = spawn_fixed_upstream(
-        StatusCode::OK,
+        AxumStatusCode::OK,
         "application/json",
         br#""hello from upstream""#.to_vec(),
     )
@@ -2263,7 +2264,7 @@ async fn json_scalar_success_response_is_passed_through_like_python() {
 #[tokio::test]
 async fn delay_stream_header_allows_json_scalar_success_response_like_python() {
     let upstream_base = spawn_fixed_upstream(
-        StatusCode::OK,
+        AxumStatusCode::OK,
         "application/json",
         br#""hello from upstream""#.to_vec(),
     )
@@ -2308,7 +2309,7 @@ async fn delay_stream_header_allows_json_scalar_success_response_like_python() {
 #[tokio::test]
 async fn delay_stream_header_skips_validation_for_non_200_success_like_python() {
     let upstream_base = spawn_fixed_upstream(
-        StatusCode::CREATED,
+        AxumStatusCode::CREATED,
         "text/plain; charset=utf-8",
         b"x".to_vec(),
     )
@@ -2353,7 +2354,7 @@ async fn delay_stream_header_skips_validation_for_non_200_success_like_python() 
 #[tokio::test]
 async fn non_200_ok_empty_response_is_passed_through_like_python() {
     let upstream_base =
-        spawn_fixed_upstream(StatusCode::NO_CONTENT, "text/plain", Vec::new()).await;
+        spawn_fixed_upstream(AxumStatusCode::NO_CONTENT, "text/plain", Vec::new()).await;
     let proxy_base = spawn_proxy_server().await;
     let config = percent_encode(&json!({}).to_string());
 
@@ -2387,7 +2388,7 @@ async fn non_200_ok_empty_response_is_passed_through_like_python() {
 #[tokio::test]
 async fn non_200_response_preserves_upstream_custom_headers_like_python() {
     let upstream_base = spawn_fixed_upstream_with_extra_header(
-        StatusCode::BAD_REQUEST,
+        AxumStatusCode::BAD_REQUEST,
         "application/json",
         br#"{"error":"bad request"}"#.to_vec(),
         ("x-upstream-marker", "kept-on-pass-through"),
@@ -2426,7 +2427,7 @@ async fn non_200_response_preserves_upstream_custom_headers_like_python() {
 #[tokio::test]
 async fn non_200_response_strips_denied_headers_like_python() {
     let upstream_base = spawn_fixed_upstream_with_headers(
-        StatusCode::BAD_REQUEST,
+        AxumStatusCode::BAD_REQUEST,
         "application/json",
         br#"{"error":"bad request"}"#.to_vec(),
         vec![
@@ -2516,7 +2517,7 @@ async fn delay_stream_header_validates_non_stream_empty_response_like_python() {
 #[tokio::test]
 async fn delay_stream_header_rejects_non_json_success_response_like_python() {
     let upstream_base = spawn_fixed_upstream(
-        StatusCode::OK,
+        AxumStatusCode::OK,
         "text/plain; charset=utf-8",
         b"plain text body".to_vec(),
     )
@@ -2556,7 +2557,7 @@ async fn delay_stream_header_rejects_non_json_success_response_like_python() {
 async fn delay_stream_header_non_json_transform_failure_uses_client_format_for_validation_like_python(
 ) {
     let upstream_base = spawn_fixed_upstream(
-        StatusCode::OK,
+        AxumStatusCode::OK,
         "text/plain; charset=utf-8",
         b"plain text body".to_vec(),
     )
@@ -2613,7 +2614,7 @@ async fn spawn_json_upstream_with_header(
         post(move || {
             let body = body.clone();
             let header = header;
-            async move { (StatusCode::OK, [(header.0, header.1)], Json(body)) }
+            async move { (AxumStatusCode::OK, [(header.0, header.1)], Json(body)) }
         }),
     );
 
@@ -2634,7 +2635,7 @@ async fn spawn_json_upstream_with_header(
 }
 
 async fn spawn_fixed_upstream(
-    status: StatusCode,
+    status: AxumStatusCode,
     content_type: &'static str,
     body: Vec<u8>,
 ) -> String {
@@ -2643,7 +2644,7 @@ async fn spawn_fixed_upstream(
 }
 
 async fn spawn_fixed_upstream_with_extra_header(
-    status: StatusCode,
+    status: AxumStatusCode,
     content_type: &'static str,
     body: Vec<u8>,
     header: (&'static str, &'static str),
@@ -2652,7 +2653,7 @@ async fn spawn_fixed_upstream_with_extra_header(
 }
 
 async fn spawn_fixed_upstream_with_headers(
-    status: StatusCode,
+    status: AxumStatusCode,
     content_type: &'static str,
     body: Vec<u8>,
     headers: Vec<(&'static str, &'static str)>,

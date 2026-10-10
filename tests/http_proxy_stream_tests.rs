@@ -30,8 +30,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::http::{header::CONTENT_TYPE, StatusCode};
+use axum::http::{header::CONTENT_TYPE as AxumContentType, StatusCode as AxumStatusCode};
 use axum::response::Response;
+use reqwest::StatusCode;
+use reqwest::header::CONTENT_TYPE;
 use axum::routing::post;
 use axum::{Json, Router};
 use bytes::Bytes;
@@ -693,7 +695,7 @@ async fn delay_stream_header_allows_large_unrecognized_stream_after_protection_l
 #[tokio::test]
 async fn non_200_sse_is_passed_through_without_delay_validation_like_python() {
     let upstream_base = spawn_status_sse_upstream(
-        StatusCode::TOO_MANY_REQUESTS,
+        AxumStatusCode::TOO_MANY_REQUESTS,
         "data: {\"error\":\"busy\"}\n\n",
     )
     .await;
@@ -742,7 +744,7 @@ async fn non_200_sse_is_passed_through_without_delay_validation_like_python() {
 #[tokio::test]
 async fn non_200_ok_sse_is_still_passed_through_like_python() {
     let upstream_base =
-        spawn_status_sse_upstream(StatusCode::CREATED, "data: {\"created\":\"yes\"}\n\n").await;
+        spawn_status_sse_upstream(AxumStatusCode::CREATED, "data: {\"created\":\"yes\"}\n\n").await;
     let proxy_base = spawn_proxy_server().await;
     let config = percent_encode(
         &json!({
@@ -789,7 +791,7 @@ async fn non_200_ok_sse_is_still_passed_through_like_python() {
 #[tokio::test]
 async fn non_200_sse_preserves_custom_headers_and_strips_denied_like_python() {
     let upstream_base = spawn_status_sse_upstream_with_headers(
-        StatusCode::TOO_MANY_REQUESTS,
+        AxumStatusCode::TOO_MANY_REQUESTS,
         "data: {\"error\":\"busy\"}\n\n",
         vec![
             ("x-upstream-marker", "kept-on-pass-through"),
@@ -852,7 +854,7 @@ async fn non_200_sse_preserves_custom_headers_and_strips_denied_like_python() {
 #[tokio::test]
 async fn stream_request_non_200_json_error_preserves_json_content_type_like_python() {
     let upstream_base = spawn_status_json_upstream(
-        StatusCode::TOO_MANY_REQUESTS,
+        AxumStatusCode::TOO_MANY_REQUESTS,
         json!({
             "error": {
                 "message": "busy"
@@ -905,7 +907,7 @@ async fn stream_request_non_200_json_error_preserves_json_content_type_like_pyth
 #[tokio::test]
 async fn stream_request_with_non_stream_json_success_stays_json_like_python() {
     let upstream_base = spawn_status_json_upstream(
-        StatusCode::OK,
+        AxumStatusCode::OK,
         json!({
             "id": "resp_sync",
             "object": "response",
@@ -1747,8 +1749,8 @@ async fn spawn_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "text/event-stream")
                 .body(Body::from(payload.to_string()))
                 .expect("sse response")
         }),
@@ -1775,8 +1777,8 @@ async fn spawn_empty_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "text/event-stream")
                 .body(Body::from(Vec::<u8>::new()))
                 .expect("empty sse response")
         }),
@@ -1811,8 +1813,8 @@ async fn spawn_failed_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "text/event-stream")
                 .body(Body::from(payload.to_string()))
                 .expect("failed sse response")
         }),
@@ -1847,8 +1849,8 @@ async fn spawn_incomplete_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "text/event-stream")
                 .body(Body::from(payload.to_string()))
                 .expect("incomplete sse response")
         }),
@@ -1882,8 +1884,8 @@ async fn spawn_error_event_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "text/event-stream")
                 .body(Body::from(payload.to_string()))
                 .expect("error event sse response")
         }),
@@ -1945,8 +1947,8 @@ async fn spawn_delayed_sse_upstream(chunks: Vec<(u64, &'static str)>) -> String 
                     });
 
                 Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "text/event-stream")
+                    .status(AxumStatusCode::OK)
+                    .header(AxumContentType, "text/event-stream")
                     .body(Body::wrap_stream(stream))
                     .expect("delayed sse response")
             }
@@ -1992,15 +1994,15 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_delayed\",\"m
 }
 
 async fn spawn_raw_sse_upstream(body: &'static str) -> String {
-    spawn_status_sse_upstream(StatusCode::OK, body).await
+    spawn_status_sse_upstream(AxumStatusCode::OK, body).await
 }
 
-async fn spawn_status_sse_upstream(status: StatusCode, body: &'static str) -> String {
+async fn spawn_status_sse_upstream(status: AxumStatusCode, body: &'static str) -> String {
     spawn_status_sse_upstream_with_headers(status, body, Vec::new()).await
 }
 
 async fn spawn_status_sse_upstream_with_headers(
-    status: StatusCode,
+    status: AxumStatusCode,
     body: &'static str,
     headers: Vec<(&'static str, &'static str)>,
 ) -> String {
@@ -2011,7 +2013,7 @@ async fn spawn_status_sse_upstream_with_headers(
             async move {
                 let mut response = Response::builder()
                     .status(status)
-                    .header(CONTENT_TYPE, "text/event-stream");
+                    .header(AxumContentType, "text/event-stream");
                 for (name, value) in headers {
                     response = response.header(name, value);
                 }
@@ -2050,8 +2052,8 @@ async fn spawn_mislabelled_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/json")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "application/json")
                 .body(Body::from(payload.to_string()))
                 .expect("mislabelled sse response")
         }),
@@ -2075,7 +2077,7 @@ async fn spawn_mislabelled_sse_upstream() -> String {
     format!("http://{}", addr)
 }
 
-async fn spawn_status_json_upstream(status: StatusCode, body: serde_json::Value) -> String {
+async fn spawn_status_json_upstream(status: AxumStatusCode, body: serde_json::Value) -> String {
     let app = Router::new().route(
         "/*path",
         post(move || {
@@ -2112,8 +2114,8 @@ async fn spawn_completed_without_done_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "text/event-stream")
                 .body(Body::from(payload.to_string()))
                 .expect("completed without done sse response")
         }),
@@ -2153,8 +2155,8 @@ async fn spawn_tool_call_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "text/event-stream")
                 .body(Body::from(payload.to_string()))
                 .expect("tool call sse response")
         }),
@@ -2192,8 +2194,8 @@ async fn spawn_buffered_tool_call_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "text/event-stream")
                 .body(Body::from(payload.to_string()))
                 .expect("buffered tool call sse response")
         }),
@@ -2233,8 +2235,8 @@ async fn spawn_function_call_delta_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "text/event-stream")
                 .body(Body::from(payload.to_string()))
                 .expect("function call delta sse response")
         }),
@@ -2289,8 +2291,8 @@ async fn spawn_multi_tool_call_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "text/event-stream")
                 .body(Body::from(payload.to_string()))
                 .expect("multi tool call sse response")
         }),
@@ -2328,8 +2330,8 @@ async fn spawn_missing_created_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "text/event-stream")
                 .body(Body::from(payload.to_string()))
                 .expect("missing created sse response")
         }),
@@ -2367,8 +2369,8 @@ async fn spawn_usage_shape_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "text/event-stream")
                 .body(Body::from(payload.to_string()))
                 .expect("usage shape sse response")
         }),
@@ -2402,8 +2404,8 @@ async fn spawn_openai_chat_no_initial_usage_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "text/event-stream")
                 .body(Body::from(payload.to_string()))
                 .expect("chat no initial usage sse response")
         }),
@@ -2441,8 +2443,8 @@ async fn spawn_in_progress_only_sse_upstream() -> String {
         "/*path",
         post(move || async move {
             Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
+                .status(AxumStatusCode::OK)
+                .header(AxumContentType, "text/event-stream")
                 .body(Body::from(payload.to_string()))
                 .expect("in progress only sse response")
         }),

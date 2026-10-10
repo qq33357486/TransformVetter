@@ -32,8 +32,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{StatusCode, Uri};
+use axum::http::{StatusCode as AxumStatusCode, Uri};
 use axum::response::IntoResponse;
+use reqwest::StatusCode;
 use axum::routing::{delete, patch, post};
 use axum::{Json, Router};
 use config::Settings;
@@ -534,7 +535,7 @@ async fn debug_profile_hashlinear_runtime_only_is_treated_as_local_model() {
 #[tokio::test]
 async fn upstream_non_200_json_is_passed_through_without_rewrapping() {
     let upstream_base = spawn_fixed_upstream(
-        StatusCode::TOO_MANY_REQUESTS,
+        AxumStatusCode::TOO_MANY_REQUESTS,
         "application/json",
         br#"{"error":{"message":"busy"}}"#.to_vec(),
     )
@@ -3526,9 +3527,9 @@ async fn smart_moderation_retries_llm_after_server_error_like_python() {
     };
 
     let (llm_base, hits) = spawn_sequenced_openai_chat_server(vec![
-        (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": {"message": "temporary"}})),
+        (AxumStatusCode::INTERNAL_SERVER_ERROR, json!({"error": {"message": "temporary"}})),
         (
-            StatusCode::OK,
+            AxumStatusCode::OK,
             json!({
                 "choices": [{
                     "message": {
@@ -3620,10 +3621,10 @@ async fn smart_moderation_retry_prefers_untried_models_before_repeats() {
     };
 
     let (llm_base, hits, models) = spawn_recording_sequenced_openai_chat_server(vec![
-        (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": {"message": "temporary-1"}})),
-        (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": {"message": "temporary-2"}})),
+        (AxumStatusCode::INTERNAL_SERVER_ERROR, json!({"error": {"message": "temporary-1"}})),
+        (AxumStatusCode::INTERNAL_SERVER_ERROR, json!({"error": {"message": "temporary-2"}})),
         (
-            StatusCode::OK,
+            AxumStatusCode::OK,
             json!({
                 "choices": [{
                     "message": {
@@ -5985,11 +5986,11 @@ async fn upstream_head_echo(State(state): State<UpstreamState>, uri: Uri) -> imp
         json_body: json!({}),
     });
 
-    StatusCode::OK
+    AxumStatusCode::OK
 }
 
 async fn spawn_fixed_upstream(
-    status: StatusCode,
+    status: AxumStatusCode,
     content_type: &'static str,
     body: Vec<u8>,
 ) -> String {
@@ -6036,7 +6037,7 @@ async fn spawn_delayed_openai_chat_server(response_body: Value, delay: Duration)
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
-                (StatusCode::OK, Json(response_body))
+                (AxumStatusCode::OK, Json(response_body))
             }
         }),
     );
@@ -6067,7 +6068,7 @@ async fn spawn_counting_openai_chat_server(response_body: Value) -> (String, Arc
             let hits = app_hits.clone();
             async move {
                 *hits.lock().expect("hits lock") += 1;
-                (StatusCode::OK, Json(response_body))
+                (AxumStatusCode::OK, Json(response_body))
             }
         }),
     );
@@ -6089,7 +6090,7 @@ async fn spawn_counting_openai_chat_server(response_body: Value) -> (String, Arc
 }
 
 async fn spawn_sequenced_openai_chat_server(
-    responses: Vec<(StatusCode, Value)>,
+    responses: Vec<(AxumStatusCode, Value)>,
 ) -> (String, Arc<Mutex<usize>>) {
     let hits = Arc::new(Mutex::new(0usize));
     let remaining = Arc::new(Mutex::new(responses));
@@ -6106,7 +6107,7 @@ async fn spawn_sequenced_openai_chat_server(
                     let mut guard = remaining.lock().expect("remaining lock");
                     if guard.is_empty() {
                         (
-                            StatusCode::INTERNAL_SERVER_ERROR,
+                            AxumStatusCode::INTERNAL_SERVER_ERROR,
                             json!({"error": {"message": "no response scripted"}}),
                         )
                     } else {
@@ -6135,7 +6136,7 @@ async fn spawn_sequenced_openai_chat_server(
 }
 
 async fn spawn_recording_sequenced_openai_chat_server(
-    responses: Vec<(StatusCode, Value)>,
+    responses: Vec<(AxumStatusCode, Value)>,
 ) -> (String, Arc<Mutex<usize>>, Arc<Mutex<Vec<String>>>) {
     let hits = Arc::new(Mutex::new(0usize));
     let seen_models = Arc::new(Mutex::new(Vec::new()));
@@ -6162,7 +6163,7 @@ async fn spawn_recording_sequenced_openai_chat_server(
                     let mut guard = remaining.lock().expect("remaining lock");
                     if guard.is_empty() {
                         (
-                            StatusCode::INTERNAL_SERVER_ERROR,
+                            AxumStatusCode::INTERNAL_SERVER_ERROR,
                             json!({"error": {"message": "no response scripted"}}),
                         )
                     } else {
@@ -6207,7 +6208,7 @@ async fn upstream_echo(
         json_body: json_body.clone(),
     });
 
-    (StatusCode::OK, Json(json!({"ok": true})))
+    (AxumStatusCode::OK, Json(json!({"ok": true})))
 }
 
 async fn spawn_proxy_server() -> String {
