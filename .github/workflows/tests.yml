@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - deploy-harden
   pull_request:
   workflow_dispatch:
 

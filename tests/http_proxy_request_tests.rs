@@ -444,6 +444,7 @@ async fn debug_profile_exposes_training_and_model_status() {
     )
     .expect("write profile");
     std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"model").expect("write model marker");
+    write_hashlinear_runtime(&profile_dir, 0.0, &[0.0]);
     std::fs::write(
         profile_dir.join(".train_status.json"),
         json!({
@@ -481,7 +482,7 @@ async fn debug_profile_exposes_training_and_model_status() {
 }
 
 #[tokio::test]
-async fn debug_profile_hashlinear_runtime_only_is_not_treated_as_local_model() {
+async fn debug_profile_hashlinear_runtime_only_is_treated_as_local_model() {
     let profile_name = format!(
         "debug-profile-hashlinear-runtime-only-{}",
         std::process::id()
@@ -525,7 +526,7 @@ async fn debug_profile_hashlinear_runtime_only_is_not_treated_as_local_model() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["profile_name"], profile_name);
-    assert_eq!(body["local_model_exists"], false);
+    assert_eq!(body["local_model_exists"], true);
     assert_eq!(body["training_decision"]["should_train"], true);
     assert_eq!(body["training_decision"]["reason"], "model_missing");
 }

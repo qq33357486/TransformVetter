@@ -46,12 +46,12 @@ impl Settings {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8000),
-            debug: parse_bool_env("DEBUG", true),
+            debug: parse_bool_env("DEBUG", false),
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "INFO".to_string()),
             upstream_http_timeout_secs: env::var("UPSTREAM_HTTP_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(60),
+                .unwrap_or(300),
             access_log_file: env::var("ACCESS_LOG_FILE")
                 .unwrap_or_else(|_| "logs/access.log".to_string()),
             moderation_log_file: env::var("MODERATION_LOG_FILE")
@@ -120,7 +120,7 @@ mod tests {
 
         let settings = Settings::load(&root_dir).expect("load settings");
 
-        assert_eq!(settings.upstream_http_timeout_secs, 60);
+        assert_eq!(settings.upstream_http_timeout_secs, 300);
         assert!(settings.training_data_rpc_enabled);
         assert_eq!(settings.training_data_rpc_transport, "unix");
         assert_eq!(

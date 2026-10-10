@@ -17,6 +17,7 @@ const RUNNING_STATUS_STALE_SECS: u64 = 2 * 60 * 60;
 pub struct TrainingSubprocessCommand {
     pub program: String,
     pub args: Vec<String>,
+    pub working_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +157,18 @@ pub fn build_training_subprocess_command(
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     let working_dir = PathBuf::from(root_dir);
 
+    if !systemd_run_available() {
+        info!("systemd-run not found in PATH; falling back to direct training subprocess");
+        return Ok(TrainingSubprocessCommand {
+            program: current_exe.display().to_string(),
+            args: vec![
+                "train-profile".to_string(),
+                profile_name.to_string(),
+            ],
+            working_dir: Some(working_dir),
+        });
+    }
+
     Ok(TrainingSubprocessCommand {
         program: "systemd-run".to_string(),
         args: vec![
@@ -168,7 +181,31 @@ pub fn build_training_subprocess_command(
             "train-profile".to_string(),
             profile_name.to_string(),
         ],
+        working_dir: None,
     })
+}
+
+fn systemd_run_available() -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| {
+        let candidate = dir.join("systemd-run");
+        candidate.is_file() && is_executable(&candidate)
+    })
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .map(|meta| meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> bool {
+    true
 }
 
 pub async fn plan_training_round(
@@ -225,11 +262,25 @@ pub fn spawn_detached_command(
     args: &[String],
     profile_name: &str,
 ) -> Result<u32> {
-    let mut child = std::process::Command::new(program)
+    spawn_detached_command_with_dir(program, args, None, profile_name)
+}
+
+fn spawn_detached_command_with_dir(
+    program: &str,
+    args: &[String],
+    working_dir: Option<&Path>,
+    profile_name: &str,
+) -> Result<u32> {
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    if let Some(dir) = working_dir {
+        command.current_dir(dir);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn detached command for {}", profile_name))?;
     let pid = child.id();
@@ -264,7 +315,12 @@ pub async fn spawn_training_subprocess(
         profile_name,
         &settings.training_subprocess_allowed_cpus,
     )?;
-    spawn_detached_command(&command.program, &command.args, profile_name)
+    spawn_detached_command_with_dir(
+        &command.program,
+        &command.args,
+        command.working_dir.as_deref(),
+        profile_name,
+    )
 }
 
 pub async fn run_scheduler_once(settings: &Settings) -> Result<Vec<PlannedTrainingAction>> {
@@ -272,6 +328,9 @@ pub async fn run_scheduler_once(settings: &Settings) -> Result<Vec<PlannedTraini
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::ZERO)
         .as_secs();
+    if !training_window_allows_launch(now_unix_secs) {
+        return Ok(Vec::new());
+    }
     let planned = plan_training_round(&settings.root_dir, settings, now_unix_secs).await?;
 
     for action in &planned {
@@ -287,6 +346,64 @@ pub async fn run_scheduler_once(settings: &Settings) -> Result<Vec<PlannedTraini
     }
 
     Ok(planned)
+}
+
+fn training_window_allows_launch(now_unix_secs: u64) -> bool {
+    let Ok(raw) = std::env::var("TRAINING_SCHEDULER_WINDOW") else {
+        return true;
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return true;
+    }
+    let Some((start, end)) = parse_hour_window(raw) else {
+        warn!(window = %raw, "invalid TRAINING_SCHEDULER_WINDOW, ignoring");
+        return true;
+    };
+    let hour = local_hour(now_unix_secs);
+    if hour_in_window(hour, start, end) {
+        true
+    } else {
+        info!(window = %raw, hour, "scheduler round skipped: outside training window");
+        false
+    }
+}
+
+fn parse_hour_window(raw: &str) -> Option<(u32, u32)> {
+    let (start, end) = raw.split_once('-')?;
+    let start = start.trim().parse::<u32>().ok()?;
+    let end = end.trim().parse::<u32>().ok()?;
+    if start > 23 || end > 23 {
+        return None;
+    }
+    Some((start, end))
+}
+
+fn hour_in_window(hour: u32, start: u32, end: u32) -> bool {
+    if start == end {
+        return hour == start;
+    }
+    if start < end {
+        hour >= start && hour < end
+    } else {
+        hour >= start || hour < end
+    }
+}
+
+#[cfg(unix)]
+fn local_hour(now_unix_secs: u64) -> u32 {
+    let timestamp = now_unix_secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::localtime_r(&timestamp, &mut tm) };
+    if rc.is_null() {
+        return ((now_unix_secs / 3600) % 24) as u32;
+    }
+    u32::try_from(tm.tm_hour).unwrap_or(0)
+}
+
+#[cfg(not(unix))]
+fn local_hour(now_unix_secs: u64) -> u32 {
+    ((now_unix_secs / 3600) % 24) as u32
 }
 
 pub fn start_scheduler_loop(settings: Settings) -> Option<JoinHandle<()>> {

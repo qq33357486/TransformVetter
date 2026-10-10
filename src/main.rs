@@ -43,7 +43,10 @@ async fn main() -> Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     match select_startup_mode(&args)? {
         StartupMode::Server => run_server().await,
-        StartupMode::TrainProfile => run_training_subprocess_from_args(&args).await,
+        StartupMode::TrainProfile => {
+            lower_process_priority();
+            run_training_subprocess_from_args(&args).await
+        }
     }
 }
 
@@ -51,7 +54,6 @@ async fn run_server() -> Result<()> {
     let root_dir = std::env::current_dir().context("failed to resolve current dir")?;
     let settings = Settings::load(&root_dir)?;
     init_tracing(&settings.log_level);
-    lower_process_priority();
     prepare_sample_rpc(&settings)?;
     let sample_rpc_task = start_sample_rpc_server(&settings)?;
     let scheduler_task = start_scheduler_loop(settings.clone());
@@ -62,7 +64,8 @@ async fn run_server() -> Result<()> {
             .tcp_keepalive(std::time::Duration::from_secs(30))
             .pool_idle_timeout(std::time::Duration::from_secs(30))
             .pool_max_idle_per_host(200)
-            .timeout(std::time::Duration::from_secs(
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(
                 settings.upstream_http_timeout_secs,
             ))
             .build()

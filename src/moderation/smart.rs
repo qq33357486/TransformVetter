@@ -25,10 +25,11 @@ use crate::storage::SampleStorage;
 const MAX_LLM_CONCURRENCY: usize = 5;
 const CACHE_SIZE: usize = 1024;
 const MAX_CACHE_PROFILES: usize = 50;
+const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
 static LLM_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static MODERATION_CACHE: OnceLock<
-    Mutex<IndexMap<String, IndexMap<String, SmartModerationResult>>>,
+    Mutex<IndexMap<String, IndexMap<String, ModerationCacheEntry>>>,
 > = OnceLock::new();
 #[cfg(feature = "storage-debug")]
 static HISTORY_STORAGE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
@@ -759,11 +760,13 @@ fn parse_moderation_content(content: &str) -> Result<SmartModerationResult, Smar
     let data: Value = serde_json::from_str(json_text)
         .map_err(|err| anyhow!(err).context("failed to decode moderation JSON"))?;
 
+    let violation = data
+        .get("violation")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("llm moderation response missing boolean violation"))?;
+
     Ok(SmartModerationResult {
-        violation: data
-            .get("violation")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        violation,
         category: data
             .get("category")
             .and_then(Value::as_str)
@@ -784,13 +787,23 @@ fn extract_json_object(content: &str) -> Option<&str> {
     (end > start).then_some(&content[start..=end])
 }
 
+#[derive(Debug, Clone)]
+struct ModerationCacheEntry {
+    result: SmartModerationResult,
+    written_at: Instant,
+}
+
 fn check_cache(profile_name: &str, text: &str) -> Option<SmartModerationResult> {
     let cache = MODERATION_CACHE.get_or_init(|| Mutex::new(IndexMap::new()));
     let key = cache_key(text);
     let mut guard = cache.lock().expect("moderation cache");
     let profile_cache = guard.get_mut(profile_name)?;
-    let mut result = profile_cache.shift_remove(&key)?;
-    profile_cache.insert(key, result.clone());
+    let entry = profile_cache.shift_remove(&key)?;
+    if entry.written_at.elapsed() > CACHE_TTL {
+        return None;
+    }
+    profile_cache.insert(key, entry.clone());
+    let mut result = entry.result;
     result.debug = None;
     Some(result)
 }
@@ -808,7 +821,13 @@ fn save_cache(profile_name: &str, text: &str, result: &SmartModerationResult) {
     profile_cache.shift_remove(&key);
     let mut cached = result.clone();
     cached.debug = None;
-    profile_cache.insert(key, cached);
+    profile_cache.insert(
+        key,
+        ModerationCacheEntry {
+            result: cached,
+            written_at: Instant::now(),
+        },
+    );
     while profile_cache.len() > CACHE_SIZE {
         profile_cache.shift_remove_index(0);
     }

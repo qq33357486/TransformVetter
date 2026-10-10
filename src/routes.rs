@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::get;
@@ -26,6 +26,7 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
+    let debug_enabled = state.settings.debug;
     let router = Router::new()
         .route(
             "/openapi.json",
@@ -40,22 +41,6 @@ pub fn router(state: AppState) -> Router {
         .route("/redoc/", get(redoc_redirect))
         .route("/redoc", get(redoc_html).fallback(method_not_allowed))
         .route("/healthz", get(healthz).fallback(method_not_allowed))
-        .route(
-            "/debug/settings",
-            get(debug_settings).fallback(method_not_allowed),
-        )
-        .route(
-            "/debug/proxy-config/:key",
-            get(debug_proxy_config).fallback(method_not_allowed),
-        )
-        .route(
-            "/debug/profile/:profile",
-            get(debug_profile).fallback(method_not_allowed),
-        )
-        .route(
-            "/debug/url-config",
-            get(debug_url_config).fallback(method_not_allowed),
-        )
         .route(
             "/",
             get(proxy_entry_root)
@@ -73,7 +58,37 @@ pub fn router(state: AppState) -> Router {
                 .fallback(method_not_allowed),
         );
 
-    attach_storage_debug_routes(attach_storage_profile_routes(router)).with_state(state)
+    let router = if debug_enabled {
+        router
+            .route(
+                "/debug/settings",
+                get(debug_settings).fallback(method_not_allowed),
+            )
+            .route(
+                "/debug/proxy-config/:key",
+                get(debug_proxy_config).fallback(method_not_allowed),
+            )
+            .route(
+                "/debug/profile/:profile",
+                get(debug_profile).fallback(method_not_allowed),
+            )
+            .route(
+                "/debug/url-config",
+                get(debug_url_config).fallback(method_not_allowed),
+            )
+    } else {
+        router
+    };
+
+    let router = if debug_enabled {
+        attach_storage_debug_routes(attach_storage_profile_routes(router))
+    } else {
+        router
+    };
+
+    router
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
+        .with_state(state)
 }
 
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {

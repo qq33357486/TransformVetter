@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use serde_json::Value;
+use tracing::warn;
 
 #[derive(Debug, Clone)]
 pub struct BasicModerationBlock {
@@ -81,6 +82,7 @@ fn load_keywords(path: &str) -> Result<Vec<KeywordPattern>> {
             })
             .collect()
     } else {
+        warn!("moderation keywords file not found: {path}");
         Vec::new()
     };
 

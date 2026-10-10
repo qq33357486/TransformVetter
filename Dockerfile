@@ -25,7 +25,7 @@ COPY artifacts ./artifacts
 COPY start.sh ./start.sh
 COPY README.md ./README.md
 
-RUN cargo build --release
+RUN cargo build --release --features storage-debug
 
 FROM ubuntu:24.04 AS runtime
 WORKDIR /app
@@ -42,6 +42,6 @@ COPY --from=builder /app/artifacts /app/artifacts
 COPY --from=builder /app/start.sh /app/start.sh
 COPY --from=builder /app/README.md /app/README.md
 
-EXPOSE 8080
+EXPOSE 8000
 
 ENTRYPOINT ["/app/TransformVetter"]

@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - deploy-harden
     tags:
       - 'v*'
   workflow_dispatch:
@@ -13,7 +14,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/cassiopeiacode/transformvetter
+  IMAGE_NAME: ghcr.io/qq33357486/transformvetter
   LIBCLANG_PATH: /usr/lib/llvm-18/lib
 
 jobs:

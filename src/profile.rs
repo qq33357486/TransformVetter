@@ -1,9 +1,26 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptTemplateSignature {
+    modified_at: Option<SystemTime>,
+    len: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct PromptTemplateEntry {
+    signature: PromptTemplateSignature,
+    template: String,
+}
+
+static PROMPT_TEMPLATES: OnceLock<Mutex<HashMap<String, PromptTemplateEntry>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AiConfig {
@@ -384,10 +401,31 @@ impl ModerationProfile {
 
     pub fn get_prompt_template(&self) -> String {
         let template_path = self.base_dir.join(&self.config.prompt.template_file);
-        if let Ok(raw) = fs::read_to_string(&template_path) {
-            return raw;
+        let cache_key = template_path.display().to_string();
+        let signature = prompt_template_signature(&template_path);
+
+        let cache = PROMPT_TEMPLATES.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let guard = cache.lock().expect("prompt template cache");
+            if let Some(entry) = guard.get(&cache_key) {
+                if entry.signature == signature {
+                    return entry.template.clone();
+                }
+            }
         }
-        "请判断以下文本是否违规：\n{{text}}".to_string()
+
+        let template = fs::read_to_string(&template_path)
+            .unwrap_or_else(|_| "请判断以下文本是否违规：\n{{text}}".to_string());
+
+        let mut guard = cache.lock().expect("prompt template cache");
+        guard.insert(
+            cache_key,
+            PromptTemplateEntry {
+                signature,
+                template: template.clone(),
+            },
+        );
+        template
     }
 
     pub fn truncate_text(&self, text: &str) -> String {
@@ -419,9 +457,12 @@ impl ModerationProfile {
 
     pub fn local_model_exists(&self) -> bool {
         match self.config.local_model_type.as_str() {
-            "fasttext" => self.fasttext_model_path().exists(),
-            "hashlinear" => self.hashlinear_model_path().exists(),
-            _ => self.bow_model_path().exists() && self.bow_vectorizer_path().exists(),
+            "fasttext" => self.fasttext_runtime_json_path().exists(),
+            "hashlinear" => {
+                self.hashlinear_runtime_json_path().exists()
+                    && self.hashlinear_runtime_coef_path().exists()
+            }
+            _ => self.bow_runtime_json_path().exists() && self.bow_runtime_coef_path().exists(),
         }
     }
 
@@ -429,6 +470,21 @@ impl ModerationProfile {
         let path = self.training_status_path();
         let raw = fs::read_to_string(path).ok()?;
         serde_json::from_str(&raw).ok()
+    }
+}
+
+fn prompt_template_signature(path: &Path) -> PromptTemplateSignature {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+
+    match fs::metadata(&canonical) {
+        Ok(metadata) => PromptTemplateSignature {
+            modified_at: metadata.modified().ok(),
+            len: Some(metadata.len()),
+        },
+        Err(_) => PromptTemplateSignature {
+            modified_at: None,
+            len: None,
+        },
     }
 }
 

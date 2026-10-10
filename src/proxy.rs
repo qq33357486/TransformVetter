@@ -83,13 +83,15 @@ async fn proxy_entry_with_cfg(
     } else {
         upstream.path().to_string()
     };
+    let query = upstream.query().map(str::to_string);
 
     let (parts, body) = request.into_parts();
     let raw_body = to_bytes(body).await.map_err(|e| {
         ApiError::new(StatusCode::BAD_REQUEST, format!("failed to read body: {e}"))
             .with_code("PROXY_ERROR")
     })?;
-    let request_json = parse_request_json(&parts.method, &parts.headers, &raw_body)?;
+    let (request_json, decoded_body) =
+        parse_request_json(&parts.method, &parts.headers, &raw_body)?;
     let source_format_hint = detect_source_format(&path, request_json.as_ref()).map(str::to_string);
     let mut request_body = request_json
         .clone()
@@ -226,17 +228,35 @@ async fn proxy_entry_with_cfg(
     let final_url = build_upstream_url(
         &upstream_base,
         &request_plan.path,
+        query.as_deref(),
         request_plan.target_format,
         is_stream,
     );
     request_body = request_plan.body;
+    let forward_planned_json = should_forward_planned_json(&parts.method);
+    let passthrough_raw_body = if request_plan.passthrough {
+        decoded_body
+    } else {
+        None
+    };
 
     let mut upstream_request = state
         .http_client
-        .request(parts.method.clone(), final_url)
-        .headers(filtered_request_headers(&parts.headers));
+        .request(
+            parts.method
+                .as_str()
+                .parse()
+                .expect("valid request method"),
+            final_url,
+        )
+        .headers(filtered_request_headers(
+            &parts.headers,
+            forward_planned_json,
+        ));
 
-    if should_forward_planned_json(&parts.method) {
+    if let Some(passthrough_raw_body) = passthrough_raw_body {
+        upstream_request = upstream_request.body(passthrough_raw_body);
+    } else if forward_planned_json {
         upstream_request =
             upstream_request.body(serde_json::to_vec(&request_body).map_err(|e| {
                 ApiError::new(
@@ -251,7 +271,7 @@ async fn proxy_entry_with_cfg(
 
     let upstream_response = upstream_request.send().await.map_err(|e| {
         ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
             format!("upstream request failed: {e}"),
         )
         .with_code("PROXY_ERROR")
@@ -295,21 +315,21 @@ fn parse_request_json(
     method: &Method,
     headers: &HeaderMap,
     raw_body: &[u8],
-) -> Result<Option<Value>, ApiError> {
+) -> Result<(Option<Value>, Option<Vec<u8>>), ApiError> {
     if raw_body.is_empty() {
-        return Ok(None);
+        return Ok((None, None));
     }
 
     if !matches!(*method, Method::POST | Method::PUT) {
-        return Ok(None);
+        return Ok((None, None));
     }
 
     match decompress_body(headers, raw_body) {
         Ok(decoded) => match serde_json::from_slice::<Value>(&decoded) {
-            Ok(value) => Ok(Some(value)),
-            Err(_) => Ok(None),
+            Ok(value) => Ok((Some(value), Some(decoded))),
+            Err(_) => Ok((None, None)),
         },
-        Err(_) => Ok(None),
+        Err(_) => Ok((None, None)),
     }
 }
 
@@ -363,15 +383,29 @@ fn decompress_body(headers: &HeaderMap, raw_body: &[u8]) -> Result<Vec<u8>, ApiE
     }
 }
 
-fn filtered_request_headers(headers: &HeaderMap) -> HeaderMap {
-    let mut out = HeaderMap::new();
+fn filtered_request_headers(
+    headers: &HeaderMap,
+    strip_content_encoding: bool,
+) -> reqwest::header::HeaderMap {
+    let mut out = reqwest::header::HeaderMap::new();
     for (name, value) in headers.iter() {
         if name == HOST || name == CONTENT_LENGTH || name == ACCEPT_ENCODING {
             continue;
         }
-        out.append(name.clone(), value.clone());
+        if strip_content_encoding && name == CONTENT_ENCODING {
+            continue;
+        }
+        if let (Some(name), Some(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()).ok(),
+            reqwest::header::HeaderValue::from_bytes(value.as_bytes()).ok(),
+        ) {
+            out.append(name, value);
+        }
     }
-    out.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    out.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
     out
 }
 
@@ -462,10 +496,16 @@ fn should_forward_planned_json(method: &Method) -> bool {
 fn build_upstream_url(
     upstream_base: &str,
     path: &str,
+    query: Option<&str>,
     target_format: Option<crate::format::RequestFormat>,
     is_stream: bool,
 ) -> String {
     let mut url = format!("{upstream_base}{path}");
+    if let Some(query) = query.filter(|query| !query.is_empty()) {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        url.push(separator);
+        url.push_str(query);
+    }
     if target_format == Some(crate::format::RequestFormat::GeminiChat)
         && is_stream
         && path.contains("streamGenerateContent")
@@ -530,7 +570,8 @@ async fn build_streaming_proxy_response(
     headers: &HeaderMap,
     moderation_debug: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let status = upstream_response.status();
+    let status = StatusCode::from_u16(upstream_response.status().as_u16())
+        .expect("valid upstream status code");
     let upstream_content_type = upstream_response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -583,7 +624,7 @@ async fn build_streaming_proxy_response(
                 None => {
                     if let Some(checker) = precheck.as_mut() {
                         if let Some(message) = checker.finish() {
-                            return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, message)
+                            return Err(ApiError::new(StatusCode::BAD_GATEWAY, message)
                                 .with_code("UPSTREAM_STREAM_ERROR")
                                 .with_error_type("upstream_stream_error"));
                         }
@@ -650,7 +691,8 @@ async fn build_non_stream_proxy_response(
     headers: &HeaderMap,
     moderation_debug: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let status = upstream_response.status();
+    let status = StatusCode::from_u16(upstream_response.status().as_u16())
+        .expect("valid upstream status code");
     let upstream_content_type = upstream_response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -677,7 +719,7 @@ async fn build_non_stream_proxy_response(
 }
 
 fn build_non_stream_proxy_response_from_body(
-    status: reqwest::StatusCode,
+    status: StatusCode,
     upstream_content_type: Option<&str>,
     headers: &HeaderMap,
     body: Vec<u8>,
@@ -939,7 +981,7 @@ fn stream_read_error(err: reqwest::Error) -> std::io::Error {
 }
 
 fn build_response(
-    status: reqwest::StatusCode,
+    status: StatusCode,
     headers: &HeaderMap,
     body: BoxBody,
 ) -> Result<Response, ApiError> {
@@ -965,7 +1007,9 @@ fn filtered_response_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap 
             continue;
         }
         if let Ok(header_name) = HeaderName::from_bytes(name.as_str().as_bytes()) {
-            out.append(header_name, value.clone());
+            if let Ok(header_value) = HeaderValue::from_bytes(value.as_bytes()) {
+                out.append(header_name, header_value);
+            }
         }
     }
     out
