@@ -1373,10 +1373,7 @@ fn smart_moderation_error_message(result: &smart::SmartModerationResult) -> Stri
         reason = result.reason.as_deref().unwrap_or(""),
         "smart moderation blocked"
     );
-    format!(
-        "[MODERATION_BLOCKED] {}",
-        crate::moderation::MODERATION_BLOCKED_MESSAGE
-    )
+    crate::moderation::MODERATION_BLOCKED_MESSAGE.to_string()
 }
 
 fn validate_response_content(

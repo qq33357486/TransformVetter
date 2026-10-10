@@ -45,10 +45,6 @@ pub fn basic_moderation(text: &str, cfg: &Value) -> Result<Option<BasicModeratio
         .and_then(Value::as_str)
         .unwrap_or("configs/keywords.txt");
     let patterns = load_keywords(keywords_file)?;
-    let error_code = cfg
-        .get("error_code")
-        .and_then(Value::as_str)
-        .unwrap_or("BASIC_MODERATION_BLOCKED");
     let normalized = text.to_ascii_lowercase();
 
     for kw in patterns {
@@ -56,7 +52,7 @@ pub fn basic_moderation(text: &str, cfg: &Value) -> Result<Option<BasicModeratio
             // 命中词只进服务端日志,不回显给调用方
             info!(keyword = %kw.original, "basic moderation blocked");
             return Ok(Some(BasicModerationBlock {
-                reason: format!("[{error_code}] {MODERATION_BLOCKED_MESSAGE}"),
+                reason: MODERATION_BLOCKED_MESSAGE.to_string(),
             }));
         }
     }
