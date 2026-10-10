@@ -355,12 +355,9 @@ async fn smart_moderation_local_hashlinear_blocks_before_upstream_proxy_call() {
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
     assert_eq!(body["error"]["source_format"], "openai_chat");
-    assert_eq!(body["error"]["moderation_details"]["source"], "hashlinear_model");
     assert!(
-        body["error"]["moderation_details"]["confidence"]
-            .as_f64()
-            .expect("confidence")
-            > 0.8
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
     assert!(seen.lock().expect("seen lock").is_empty());
 }

@@ -813,9 +813,10 @@ async fn smart_moderation_falls_back_to_llm_and_blocks_like_python() {
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
     assert_eq!(body["error"]["source_format"], "openai_chat");
-    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(body["error"]["moderation_details"]["category"], "abuse");
-    assert_eq!(body["error"]["moderation_details"]["reason"], "llm blocked");
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
+    );
     assert!(body["error"]["message"]
         .as_str()
         .expect("error message")
