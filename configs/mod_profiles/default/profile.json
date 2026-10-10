@@ -1,0 +1,36 @@
+{
+  "ai": {
+    "provider": "openai",
+    "base_url": "http://127.0.0.1:3000/v1",
+    "model": "glm-flash",
+    "api_key_env": "MODERATION_API_KEY",
+    "timeout": 30,
+    "max_retries": 1
+  },
+  "prompt": {
+    "template_file": "ai_prompt.txt",
+    "max_text_length": 30000
+  },
+  "probability": {
+    "ai_review_rate": 0.05,
+    "random_seed": 42,
+    "low_risk_threshold": 0.60,
+    "high_risk_threshold": 0.80,
+    "enable_concurrency_limit_fallback": true
+  },
+  "local_model_type": "hashlinear",
+  "hashlinear_training": {
+    "min_samples": 30,
+    "retrain_interval_minutes": 720,
+    "max_samples": 10000,
+    "max_db_items": 100000,
+    "sample_loading": "random_duplicate",
+    "analyzer": "char",
+    "ngram_range": [2, 4],
+    "n_features": 1048576,
+    "alpha": 0.00001,
+    "epochs": 2,
+    "batch_size": 2048,
+    "max_seconds": 300
+  }
+}

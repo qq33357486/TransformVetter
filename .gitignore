@@ -1,8 +1,19 @@
 /target
 /.env
-/configs/
 /.worktrees/
 /py-scripts/.venv/
 /py-scripts/__pycache__/
 /py-scripts/.pytest_cache/
 /py-scripts/*.egg-info/
+
+# 运行时产物不进版本控制(审核历史/训练出的模型/状态文件)
+# configs 下的模板(词库/提示词/profile.json)保留版本控制
+/configs/mod_profiles/*/history.rocks/
+/configs/mod_profiles/*/history.db*
+/configs/mod_profiles/*/*.pkl
+/configs/mod_profiles/*/hashlinear_coef.f32
+/configs/mod_profiles/*/fasttext*.bin
+/configs/mod_profiles/*/.train_status.json
+/run/
+/logs/
+*.log
