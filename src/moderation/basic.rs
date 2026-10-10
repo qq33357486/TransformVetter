@@ -6,7 +6,9 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{info, warn};
+
+use super::MODERATION_BLOCKED_MESSAGE;
 
 #[derive(Debug, Clone)]
 pub struct BasicModerationBlock {
@@ -51,8 +53,10 @@ pub fn basic_moderation(text: &str, cfg: &Value) -> Result<Option<BasicModeratio
 
     for kw in patterns {
         if normalized.contains(&kw.normalized) {
+            // 命中词只进服务端日志,不回显给调用方
+            info!(keyword = %kw.original, "basic moderation blocked");
             return Ok(Some(BasicModerationBlock {
-                reason: format!("[{}] Matched keyword: {}", error_code, kw.original),
+                reason: format!("[{error_code}] {MODERATION_BLOCKED_MESSAGE}"),
             }));
         }
     }

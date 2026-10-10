@@ -116,7 +116,7 @@ fn basic_moderation_blocks_matching_keyword_case_insensitively() {
     let blocked = blocked.expect("keyword should block");
     assert_eq!(
         blocked.reason,
-        "[BASIC_MODERATION_BLOCKED] Matched keyword: blocked phrase"
+        "[BASIC_MODERATION_BLOCKED] 请求未通过内容安全审核,已被拦截。如认为存在误判,请联系站点管理员。"
     );
 
     let _ = std::fs::remove_file(keyword_file);
@@ -152,7 +152,7 @@ fn basic_moderation_reloads_keywords_after_file_changes() {
     let refreshed = refreshed.expect("updated keyword should block");
     assert_eq!(
         refreshed.reason,
-        "[BASIC_MODERATION_BLOCKED] Matched keyword: different phrase"
+        "[BASIC_MODERATION_BLOCKED] 请求未通过内容安全审核,已被拦截。如认为存在误判,请联系站点管理员。"
     );
 
     let _ = std::fs::remove_file(keyword_file);
@@ -275,7 +275,7 @@ async fn basic_moderation_blocks_before_upstream_proxy_call() {
         body["error"]["message"]
             .as_str()
             .expect("error message")
-            .contains("[BASIC_MODERATION_BLOCKED] Matched keyword: blocked phrase")
+            .contains("[BASIC_MODERATION_BLOCKED] 请求未通过内容安全审核,已被拦截。如认为存在误判,请联系站点管理员。")
     );
     assert!(seen.lock().expect("seen lock").is_empty());
 }

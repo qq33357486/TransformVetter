@@ -183,15 +183,12 @@ async fn proxy_entry_with_cfg(
         {
             Ok(Some(result)) if result.violation => {
                 moderation_debug = moderation_debug_headers(result.debug.as_ref());
+                // 响应体不带 moderation_details(信息最小化);详情已由
+                // smart_moderation_error_message 记入服务端日志
                 return Err(ApiError::moderation_blocked(
                     smart_moderation_error_message(&result),
                     Some(moderation_format.as_str()),
-                    Some(json!({
-                        "source": result.source,
-                        "reason": result.reason,
-                        "category": result.category,
-                        "confidence": result.confidence,
-                    })),
+                    None,
                 )
                 .with_extra_headers(moderation_debug));
             }
@@ -1367,16 +1364,19 @@ fn moderation_details_for_message(message: &str) -> Option<Value> {
 }
 
 fn smart_moderation_error_message(result: &smart::SmartModerationResult) -> String {
-    let mut message = format!("Smart moderation blocked by {}", result.source);
-    if let Some(category) = result.category.as_deref() {
-        if !category.is_empty() {
-            message.push_str(&format!(" (category: {category})"));
-        }
-    }
-    if let Some(confidence) = result.confidence {
-        message.push_str(&format!(" (confidence: {confidence:.3})"));
-    }
-    message
+    // 对外统一中文文案;类别/置信度/来源只进服务端日志,不提供可被用于
+    // 迭代绕过的差异反馈
+    tracing::info!(
+        source = %result.source,
+        category = result.category.as_deref().unwrap_or(""),
+        confidence = result.confidence.unwrap_or(0.0),
+        reason = result.reason.as_deref().unwrap_or(""),
+        "smart moderation blocked"
+    );
+    format!(
+        "[MODERATION_BLOCKED] {}",
+        crate::moderation::MODERATION_BLOCKED_MESSAGE
+    )
 }
 
 fn validate_response_content(

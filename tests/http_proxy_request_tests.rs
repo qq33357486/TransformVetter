@@ -652,7 +652,7 @@ async fn basic_moderation_blocks_matching_keyword_like_python() {
     assert!(body["error"]["message"]
         .as_str()
         .expect("error message")
-        .contains("[BASIC_MODERATION_BLOCKED] Matched keyword: blocked phrase"));
+        .contains("[BASIC_MODERATION_BLOCKED] 请求未通过内容安全审核,已被拦截。如认为存在误判,请联系站点管理员。"));
 }
 
 #[tokio::test]
@@ -819,7 +819,7 @@ async fn smart_moderation_falls_back_to_llm_and_blocks_like_python() {
     assert!(body["error"]["message"]
         .as_str()
         .expect("error message")
-        .contains("Smart moderation blocked by ai"));
+        .contains("[MODERATION_BLOCKED] 请求未通过内容安全审核,已被拦截。如认为存在误判,请联系站点管理员。"));
 }
 
 #[tokio::test]
