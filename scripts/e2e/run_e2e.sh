@@ -20,16 +20,26 @@ DEAD_PORT=18099                 # 用例10:确认无监听的端口
 MOCK_HOST_FOR_TV=host.docker.internal
 UPSTREAM_URL="http://${MOCK_HOST_FOR_TV}:${MOCK_PORT}/v1/chat/completions"
 DEAD_URL="http://${MOCK_HOST_FOR_TV}:${DEAD_PORT}/v1/chat/completions"
-ROUTE="/!TEST_ROUTE${UPSTREAM_URL}"
-ROUTE_WITH_QUERY="/!TEST_ROUTE${UPSTREAM_URL}%3Falpha=1%26beta=2"
-DEAD_ROUTE="/!TEST_DEAD_ROUTE${DEAD_URL}"
+ROUTE="/!TEST_ROUTE\$${UPSTREAM_URL}"
+ROUTE_WITH_QUERY="/!TEST_ROUTE\$${UPSTREAM_URL}%3Falpha=1%26beta=2"
+DEAD_ROUTE="/!TEST_DEAD_ROUTE\$${DEAD_URL}"
 TV_BASE="http://127.0.0.1:${HOST_PORT}"
 MOCK_BASE="http://127.0.0.1:${MOCK_PORT}"
 
 TV_CONTAINER=tv-e2e
 MOCK_CONTAINER=tv-e2e-mock
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# REPO_ROOT 支持两种布局:
+#   仓库检出:  <repo>/scripts/e2e/run_e2e.sh   -> <repo>
+#   精简部署:  <root>/e2e/run_e2e.sh + <root>/configs -> <root>
+# (精简部署时 <root> 通常就是 $E2E_DIR,脚本必须能就地运行)
+if [ -f "${SCRIPT_DIR}/../../configs/keywords.txt" ]; then
+  REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+elif [ -f "${SCRIPT_DIR}/../configs/keywords.txt" ]; then
+  REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+else
+  REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"  # 交给 preflight 报缺文件
+fi
 
 # 镜像优先取环境变量,其次取第一个位置参数
 TV_IMAGE="${TV_IMAGE:-${1:-}}"
@@ -122,13 +132,20 @@ preflight() {
 
 # ---------- 环境准备 ----------
 prepare_workspace() {
-  rm -rf "$E2E_DIR"
-  mkdir -p "$E2E_DIR"/{configs/mod_profiles/e2e,mock,helpers,logs,out}
+  # 只清理本脚本拥有的子目录;精简部署布局下 $E2E_DIR 同时是部署根目录
+  # (含本脚本与 configs),不能整体 rm -rf,否则自毁。
+  rm -rf "$E2E_DIR/mock" "$E2E_DIR/helpers" "$E2E_DIR/out"
+  mkdir -p "$E2E_DIR"/configs/mod_profiles/e2e "$E2E_DIR"/{mock,helpers,logs,out}
 
-  # keywords + 复核 prompt 来自仓库
-  cp "$REPO_ROOT/configs/keywords.txt" "$E2E_DIR/configs/keywords.txt"
-  cp "$REPO_ROOT/configs/mod_profiles/default/ai_prompt.txt" \
-     "$E2E_DIR/configs/mod_profiles/e2e/ai_prompt.txt"
+  # keywords + 复核 prompt 来自仓库(精简部署时源=目标,跳过拷贝)
+  if [ "$(cd "$REPO_ROOT/configs" && pwd)" != "$(cd "$E2E_DIR/configs" && pwd)" ]; then
+    cp "$REPO_ROOT/configs/keywords.txt" "$E2E_DIR/configs/keywords.txt"
+  fi
+  if [ "$REPO_ROOT/configs/mod_profiles/default/ai_prompt.txt" != \
+       "$E2E_DIR/configs/mod_profiles/e2e/ai_prompt.txt" ]; then
+    cp "$REPO_ROOT/configs/mod_profiles/default/ai_prompt.txt" \
+       "$E2E_DIR/configs/mod_profiles/e2e/ai_prompt.txt"
+  fi
 
   # 复核 profile:复用 default 结构,指向 mock 复核端点;无本地模型文件 ->
   # 一律走 LLM 复核链路(本套件不训练模型)
@@ -422,7 +439,7 @@ case_01_healthz() {
 case_02_url_config() {
   local code out
   code=$(curl -s -o "$OUT/case2.json" -w '%{http_code}' \
-    -G "$TV_BASE/debug/url-config" --data-urlencode "value=!TEST_ROUTE$UPSTREAM_URL")
+    -G "$TV_BASE/debug/url-config" --data-urlencode "value=!TEST_ROUTE\$${UPSTREAM_URL}")
   out=$(run_py "$E2E_DIR/helpers/assert.py" urlconfig "$OUT/case2.json" "$UPSTREAM_URL" 2>&1)
   if [ "$code" = 200 ] && [ "$out" = ok ]; then
     ok 02_url_config_parse
