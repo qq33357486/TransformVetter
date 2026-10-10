@@ -28,7 +28,7 @@ MOCK_BASE="http://127.0.0.1:${MOCK_PORT}"
 
 TV_CONTAINER=tv-e2e
 MOCK_CONTAINER=tv-e2e-mock
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"  # 物理路径:兼容符号链接调用
 # REPO_ROOT 支持两种布局:
 #   仓库检出:  <repo>/scripts/e2e/run_e2e.sh   -> <repo>
 #   精简部署:  <root>/e2e/run_e2e.sh + <root>/configs -> <root>
