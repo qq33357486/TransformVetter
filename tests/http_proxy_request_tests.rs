@@ -570,7 +570,7 @@ async fn upstream_non_200_json_is_passed_through_without_rewrapping() {
 }
 
 #[tokio::test]
-async fn unreachable_upstream_returns_500_proxy_error_like_python() {
+async fn unreachable_upstream_returns_502_bad_gateway() {
     let proxy_base = spawn_proxy_server().await;
     let upstream_base = unused_http_base();
     let config = percent_encode(&json!({}).to_string());
@@ -589,7 +589,7 @@ async fn unreachable_upstream_returns_500_proxy_error_like_python() {
         .await
         .expect("proxy response");
 
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         response
             .headers()

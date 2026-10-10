@@ -538,7 +538,7 @@ async fn delay_stream_header_returns_json_error_before_committing_empty_stream()
         .await
         .expect("proxy response");
 
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         response
             .headers()
