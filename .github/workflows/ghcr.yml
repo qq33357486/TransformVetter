@@ -25,6 +25,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89.0
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: cargo build --release --features storage-debug
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 

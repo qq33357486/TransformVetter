@@ -1,0 +1,16 @@
+# Keep the build context lean; only target/release/TransformVetter is needed.
+.git
+.github
+docs
+tests
+py-scripts
+scripts
+configs
+target/debug
+target/release/build
+target/release/deps
+target/release/examples
+target/release/incremental
+target/release/*.d
+target/tmp
+target/CACHEDIR.TAG
