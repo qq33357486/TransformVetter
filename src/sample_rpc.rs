@@ -1,11 +1,14 @@
 use std::fs;
+#[cfg(unix)]
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::config::Settings;
@@ -257,6 +260,7 @@ fn trim_ascii_whitespace_end(line: &[u8]) -> &[u8] {
     &line[..end]
 }
 
+#[cfg(unix)]
 pub async fn send_unix_request(
     socket_path: &Path,
     request: &SampleRpcRequest,
@@ -283,6 +287,7 @@ pub async fn send_unix_request(
     decode_response_line(&line)
 }
 
+#[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn serve_one_unix_request<F>(
     socket_path: &Path,
@@ -297,6 +302,7 @@ where
     handle_unix_stream(stream, handler).await
 }
 
+#[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn serve_unix_requests_until_shutdown<F, Fut>(
     socket_path: &Path,
@@ -327,7 +333,7 @@ where
     Ok(())
 }
 
-#[cfg(feature = "storage-debug")]
+#[cfg(all(unix, feature = "storage-debug"))]
 pub async fn serve_storage_sample_rpc_until_shutdown<Fut>(
     socket_path: &Path,
     shutdown: Fut,
@@ -338,6 +344,7 @@ where
     serve_unix_requests_until_shutdown(socket_path, dispatch_request_with_storage, shutdown).await
 }
 
+#[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 async fn handle_unix_stream<F>(stream: UnixStream, handler: F) -> Result<()>
 where

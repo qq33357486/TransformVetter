@@ -29,7 +29,7 @@ use crate::config::Settings;
 use crate::routes::{router, AppState};
 use crate::scheduler::start_scheduler_loop;
 use crate::sample_rpc::{cleanup_stale_unix_socket, SampleRpcConfig, SampleRpcTransport};
-#[cfg(feature = "storage-debug")]
+#[cfg(all(unix, feature = "storage-debug"))]
 use crate::sample_rpc::serve_storage_sample_rpc_until_shutdown;
 use crate::training::run_training_subprocess_from_args;
 
@@ -150,15 +150,23 @@ fn start_sample_rpc_server(settings: &Settings) -> Result<Option<JoinHandle<()>>
 
     match rpc.transport {
         SampleRpcTransport::Unix => {
-            let socket_path = rpc.unix_socket.clone();
-            let handle = tokio::spawn(async move {
-                let _ = serve_storage_sample_rpc_until_shutdown(
-                    &socket_path,
-                    std::future::pending::<()>(),
-                )
-                .await;
-            });
-            Ok(Some(handle))
+            #[cfg(unix)]
+            {
+                let socket_path = rpc.unix_socket.clone();
+                let handle = tokio::spawn(async move {
+                    let _ = serve_storage_sample_rpc_until_shutdown(
+                        &socket_path,
+                        std::future::pending::<()>(),
+                    )
+                    .await;
+                });
+                Ok(Some(handle))
+            }
+            #[cfg(not(unix))]
+            {
+                warn!("sample RPC over unix sockets is unsupported on this platform; server not started");
+                Ok(None)
+            }
         }
         SampleRpcTransport::Tcp => Err(anyhow::anyhow!(
             "TRAINING_DATA_RPC_TRANSPORT=tcp is not implemented yet"
@@ -167,6 +175,7 @@ fn start_sample_rpc_server(settings: &Settings) -> Result<Option<JoinHandle<()>>
     }
 }
 
+#[cfg(unix)]
 fn lower_process_priority() {
     let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19) };
     if rc == 0 {
@@ -175,6 +184,11 @@ fn lower_process_priority() {
         let err = std::io::Error::last_os_error();
         warn!(error = %err, "failed to set process priority to nice=19");
     }
+}
+
+#[cfg(not(unix))]
+fn lower_process_priority() {
+    warn!("process priority lowering is unsupported on this platform; running at normal priority");
 }
 
 fn init_tracing(log_level: &str) {

@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::profile::ModerationProfile;
-use crate::sample_rpc::{send_unix_request, SampleRpcConfig, SampleRpcRequest};
+use crate::sample_rpc::{SampleRpcConfig, SampleRpcRequest};
+#[cfg(unix)]
+use crate::sample_rpc::send_unix_request;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrainingDecision {
@@ -137,6 +139,7 @@ pub fn build_training_sample_request(profile: &ModerationProfile) -> Result<Samp
     Ok(request)
 }
 
+#[cfg(unix)]
 pub async fn fetch_training_samples_via_rpc(
     rpc: &SampleRpcConfig,
     profile: &ModerationProfile,
@@ -144,6 +147,15 @@ pub async fn fetch_training_samples_via_rpc(
     fetch_training_samples_via_unix_socket(rpc.unix_socket_path()?, profile).await
 }
 
+#[cfg(not(unix))]
+pub async fn fetch_training_samples_via_rpc(
+    _rpc: &SampleRpcConfig,
+    _profile: &ModerationProfile,
+) -> Result<Vec<TrainingSample>> {
+    Err(anyhow!("sample RPC over unix sockets is unsupported on this platform"))
+}
+
+#[cfg(unix)]
 pub async fn fetch_training_sample_count_via_rpc(
     rpc: &SampleRpcConfig,
     profile: &ModerationProfile,
@@ -169,6 +181,15 @@ pub async fn fetch_training_sample_count_via_rpc(
     )
 }
 
+#[cfg(not(unix))]
+pub async fn fetch_training_sample_count_via_rpc(
+    _rpc: &SampleRpcConfig,
+    _profile: &ModerationProfile,
+) -> Result<usize> {
+    Err(anyhow!("sample RPC over unix sockets is unsupported on this platform"))
+}
+
+#[cfg(unix)]
 pub async fn cleanup_training_samples_via_rpc(
     rpc: &SampleRpcConfig,
     profile: &ModerationProfile,
@@ -195,6 +216,15 @@ pub async fn cleanup_training_samples_via_rpc(
     )
 }
 
+#[cfg(not(unix))]
+pub async fn cleanup_training_samples_via_rpc(
+    _rpc: &SampleRpcConfig,
+    _profile: &ModerationProfile,
+) -> Result<usize> {
+    Err(anyhow!("sample RPC over unix sockets is unsupported on this platform"))
+}
+
+#[cfg(unix)]
 pub async fn fetch_training_samples_via_unix_socket(
     socket_path: &Path,
     profile: &ModerationProfile,
@@ -214,6 +244,14 @@ pub async fn fetch_training_samples_via_unix_socket(
             .as_ref()
             .ok_or_else(|| anyhow!("sample RPC response missing result payload"))?,
     )
+}
+
+#[cfg(not(unix))]
+pub async fn fetch_training_samples_via_unix_socket(
+    _socket_path: &Path,
+    _profile: &ModerationProfile,
+) -> Result<Vec<TrainingSample>> {
+    Err(anyhow!("sample RPC over unix sockets is unsupported on this platform"))
 }
 
 pub fn write_training_status(profile: &ModerationProfile, status: &Value) -> Result<()> {

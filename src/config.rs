@@ -123,9 +123,10 @@ mod tests {
         assert_eq!(settings.upstream_http_timeout_secs, 300);
         assert!(settings.training_data_rpc_enabled);
         assert_eq!(settings.training_data_rpc_transport, "unix");
+        // 用 Path 比较,避免平台路径分隔符差异(Windows 显示为反斜杠)
         assert_eq!(
-            settings.training_data_rpc_unix_socket,
-            "/tmp/prismguard-config-defaults/run/sample-store.sock"
+            Path::new(&settings.training_data_rpc_unix_socket),
+            root_dir.join("run").join("sample-store.sock")
         );
     }
 

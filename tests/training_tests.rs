@@ -19,23 +19,33 @@ use rocksdb::{DBWithThreadMode, MultiThreaded, Options};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
+#[cfg(unix)]
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sample_rpc::{
     decode_request_line, decode_response_line, dispatch_request, encode_request_line,
-    encode_response_line, send_unix_request, serve_one_unix_request,
-    serve_unix_requests_until_shutdown, SampleRpcConfig,
+    encode_response_line, SampleRpcConfig,
     SampleRpcRequest, SampleRpcResponse, SampleRpcTransport,
 };
-#[cfg(feature = "storage-debug")]
+#[cfg(unix)]
+use sample_rpc::{
+    send_unix_request, serve_one_unix_request, serve_unix_requests_until_shutdown,
+};
+#[cfg(all(unix, feature = "storage-debug"))]
 use sample_rpc::serve_storage_sample_rpc_until_shutdown;
 use training::{
-    build_training_sample_request, cleanup_training_samples_via_rpc, evaluate_training_need,
-    fetch_training_sample_count_via_rpc, fetch_training_samples_via_rpc,
-    fetch_training_samples_via_unix_socket, run_profile_training,
+    build_training_sample_request, evaluate_training_need,
     run_training_subprocess_from_args, train_bow_runtime, train_fasttext_runtime,
     train_hashlinear_runtime, write_training_status, TrainingSample,
 };
+#[cfg(unix)]
+use training::{
+    cleanup_training_samples_via_rpc, fetch_training_sample_count_via_rpc,
+    fetch_training_samples_via_rpc, run_profile_training,
+};
+#[cfg(unix)]
+use training::fetch_training_samples_via_unix_socket;
 
 fn write_profile(profile_name: &str, payload: serde_json::Value) -> ModerationProfile {
     let root_dir = unique_test_root("training-profile");
@@ -244,6 +254,7 @@ fn training_builds_sample_request_from_random_duplicate_strategy() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn training_fetches_samples_over_unix_socket() {
     let profile = write_profile(
@@ -315,6 +326,7 @@ async fn training_fetches_samples_over_unix_socket() {
     std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn training_fetches_samples_via_sample_rpc_config() {
     let profile = write_profile(
@@ -379,6 +391,7 @@ async fn training_fetches_samples_via_sample_rpc_config() {
     std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn training_fetches_sample_count_via_sample_rpc_config() {
     let profile = write_profile(
@@ -428,6 +441,7 @@ async fn training_fetches_sample_count_via_sample_rpc_config() {
     std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn training_cleans_up_samples_via_sample_rpc_config() {
     let profile = write_profile(
@@ -509,6 +523,7 @@ fn training_status_writer_persists_python_style_fields() {
     assert_eq!(status["sample_count"], 19);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn run_profile_training_cleans_samples_then_trains_hashlinear_runtime() {
     let profile = write_profile(
@@ -634,6 +649,7 @@ async fn run_profile_training_cleans_samples_then_trains_hashlinear_runtime() {
     std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn run_profile_training_cleans_samples_then_trains_bow_runtime() {
     let profile = write_profile(
@@ -743,6 +759,7 @@ async fn run_profile_training_cleans_samples_then_trains_bow_runtime() {
     std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn run_profile_training_cleans_samples_then_trains_fasttext_runtime() {
     let profile = write_profile(
@@ -844,6 +861,7 @@ async fn run_profile_training_cleans_samples_then_trains_fasttext_runtime() {
     std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[ignore = "temporarily disabled pending training subprocess status fix"]
 async fn training_subprocess_marks_success_after_runtime_write() {
@@ -990,6 +1008,7 @@ async fn training_subprocess_marks_success_after_runtime_write() {
     std::fs::remove_dir_all(&root_dir).expect("cleanup root dir");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[ignore = "temporarily disabled pending training subprocess status fix"]
 async fn training_subprocess_marks_success_after_bow_runtime_write() {
@@ -1123,6 +1142,7 @@ async fn training_subprocess_marks_success_after_bow_runtime_write() {
     std::fs::remove_dir_all(&root_dir).expect("cleanup root dir");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[ignore = "temporarily disabled pending training subprocess status fix"]
 async fn training_subprocess_marks_success_after_fasttext_runtime_write() {
@@ -1321,6 +1341,7 @@ async fn training_subprocess_marks_failed_when_rpc_unavailable() {
     std::fs::remove_dir_all(&root_dir).expect("cleanup root dir");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[ignore = "temporarily disabled pending training subprocess status fix"]
 async fn training_subprocess_marks_failed_when_bow_samples_are_single_label() {
@@ -1440,6 +1461,7 @@ async fn training_subprocess_marks_failed_when_bow_samples_are_single_label() {
     std::fs::remove_dir_all(&root_dir).expect("cleanup root dir");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[ignore = "temporarily disabled pending training subprocess status fix"]
 async fn training_subprocess_marks_failed_when_fasttext_samples_are_single_label() {
@@ -2020,6 +2042,7 @@ fn sample_rpc_response_line_codec_roundtrips() {
     assert_eq!(decoded, response);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn sample_rpc_unix_client_server_roundtrip() {
     let socket_dir = PathBuf::from(format!("/tmp/prismguard-rpc-roundtrip-{}", std::process::id()));
@@ -2073,6 +2096,7 @@ async fn sample_rpc_unix_client_server_roundtrip() {
     std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn sample_rpc_unix_server_handles_multiple_requests() {
     let socket_dir = PathBuf::from(format!("/tmp/prismguard-rpc-loop-{}", std::process::id()));
@@ -2512,7 +2536,7 @@ fn sample_rpc_dispatches_balanced_random_duplicate_samples_with_real_storage() {
     std::fs::remove_dir_all(&rocks_dir).expect("cleanup rocks dir");
 }
 
-#[cfg(feature = "storage-debug")]
+#[cfg(all(unix, feature = "storage-debug"))]
 #[tokio::test]
 async fn sample_rpc_storage_server_serves_real_sample_count_over_unix_socket() {
     let rocks_dir = PathBuf::from(format!(
@@ -2576,7 +2600,7 @@ async fn sample_rpc_storage_server_serves_real_sample_count_over_unix_socket() {
     std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
 }
 
-#[cfg(feature = "storage-debug")]
+#[cfg(all(unix, feature = "storage-debug"))]
 #[tokio::test]
 async fn sample_rpc_storage_server_serves_balanced_latest_samples_over_unix_socket() {
     let rocks_dir = PathBuf::from(format!(

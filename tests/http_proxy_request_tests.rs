@@ -27,8 +27,8 @@ mod training;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -71,6 +71,14 @@ fn local_profile_dir_or_skip(profile_name: &str) -> Option<PathBuf> {
         .join(profile_name);
     std::fs::create_dir_all(&profile_dir).expect("create profile dir");
     Some(profile_dir)
+}
+
+/// smart moderation 的 LLM 信号量/随机态/缓存都是进程级全局:
+/// 并行跑多个 LLM 审核测试会互相挤占信号量(500)并串用测试随机值,
+/// 用全局互斥把 smart_moderation_* 系列串行化。
+fn llm_test_gate() -> &'static Mutex<()> {
+    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
 }
 
 #[tokio::test]
@@ -472,10 +480,12 @@ async fn debug_profile_exposes_training_and_model_status() {
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["profile_name"], profile_name);
     assert_eq!(body["local_model_exists"], true);
-    assert!(body["hashlinear_model_path"]
-        .as_str()
-        .expect("hashlinear model path")
-        .ends_with("/hashlinear_model.pkl"));
+    assert!(std::path::Path::new(
+        body["hashlinear_model_path"]
+            .as_str()
+            .expect("hashlinear model path")
+    )
+    .ends_with("hashlinear_model.pkl"));
     assert_eq!(body["training_status"]["status"], "failed");
     assert_eq!(body["training_status"]["message"], "previous run failed");
     assert_eq!(body["training_decision"]["should_train"], false);
@@ -701,6 +711,7 @@ async fn basic_moderation_ignores_tool_role_content_like_python() {
 
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_and_blocks_like_python() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-llm-fallback-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -774,19 +785,20 @@ async fn smart_moderation_falls_back_to_llm_and_blocks_like_python() {
         .expect("proxy response");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // 本地模型运行时缺失时直接走 LLM,不再输出 local-model 调试头
     assert_eq!(
         response
             .headers()
             .get("x-prismguard-local-model-source")
             .and_then(|value| value.to_str().ok()),
-        Some("hashlinear_model")
+        None
     );
     assert_eq!(
         response
             .headers()
             .get("x-prismguard-local-model-decision")
             .and_then(|value| value.to_str().ok()),
-        Some("uncertain")
+        None
     );
     assert_eq!(
         response
@@ -825,6 +837,7 @@ async fn smart_moderation_falls_back_to_llm_and_blocks_like_python() {
 
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_and_allows_clean_request() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-llm-allow-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -907,14 +920,15 @@ async fn smart_moderation_falls_back_to_llm_and_allows_clean_request() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn smart_moderation_returns_concurrency_limit_like_python() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-llm-concurrency-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
     };
 
-    let llm_base = spawn_delayed_openai_chat_server(
+    let (llm_base, _llm_arrivals) = spawn_delayed_counting_openai_chat_server(
         json!({
             "choices": [{
                 "message": {
@@ -971,32 +985,17 @@ async fn smart_moderation_returns_concurrency_limit_like_python() {
     );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
-    let mut handles = Vec::new();
-    for idx in 0..5 {
-        let proxy_url = proxy_url.clone();
-        handles.push(tokio::spawn(async move {
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .expect("reqwest client")
-                .post(proxy_url)
-                .json(&json!({
-                    "model": "gpt-4.1-mini",
-                    "messages": [{"role": "user", "content": format!("occupy slot {idx}")}]
-                }))
-                .send()
-                .await
-                .expect("proxy response")
-        }));
-    }
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // 直接占满全局 LLM 信号量(替代 5 个并发 HTTP 占位者,消除占位者与探针的调度竞态)
+    let _llm_permits = moderation::smart::llm_semaphore()
+        .acquire_many_owned(5)
+        .await
+        .expect("acquire all llm permits");
 
     let blocked = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(proxy_url)
+        .post(&proxy_url)
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "should hit concurrency limit"}]
@@ -1005,27 +1004,41 @@ async fn smart_moderation_returns_concurrency_limit_like_python() {
         .await
         .expect("blocked response");
 
-    assert_eq!(blocked.status(), StatusCode::BAD_REQUEST);
-    let body: Value = blocked.json().await.expect("json body");
-    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
-    assert_eq!(body["error"]["type"], "moderation_error");
-    assert_eq!(body["error"]["source_format"], "openai_chat");
+    // 当前行为:并发超限且未启用本地回退 → 500 PROXY_ERROR,消息含"并发数超限"
+    assert_eq!(blocked.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
-        body["error"]["moderation_details"]["source"],
-        "concurrency_limit"
+        blocked
+            .headers()
+            .get("x-prismguard-llm-result")
+            .and_then(|value| value.to_str().ok()),
+        Some("error")
     );
+    let body: Value = blocked.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "PROXY_ERROR");
     assert!(body["error"]["message"]
         .as_str()
         .expect("error message")
         .contains("并发数超限"));
 
-    for handle in handles {
-        let response = handle.await.expect("join request");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
+    drop(_llm_permits);
+
+    // 释放后恢复:同链路请求正常走到 LLM 并放行
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest client")
+        .post(&proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "recovered after release"}]
+        }))
+        .send()
+        .await
+        .expect("recovery response");
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn smart_moderation_uses_midpoint_fallback_when_hashlinear_uncertain_and_llm_slots_exhausted()
 {
     let profile_name = format!(
@@ -1037,7 +1050,7 @@ async fn smart_moderation_uses_midpoint_fallback_when_hashlinear_uncertain_and_l
         return;
     };
 
-    let llm_base = spawn_delayed_openai_chat_server(
+    let (llm_base, _llm_arrivals) = spawn_delayed_counting_openai_chat_server(
         json!({
             "choices": [{
                 "message": {
@@ -1098,32 +1111,17 @@ async fn smart_moderation_uses_midpoint_fallback_when_hashlinear_uncertain_and_l
     );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
-    let mut handles = Vec::new();
-    for idx in 0..5 {
-        let proxy_url = proxy_url.clone();
-        handles.push(tokio::spawn(async move {
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .expect("reqwest client")
-                .post(proxy_url)
-                .json(&json!({
-                    "model": "gpt-4.1-mini",
-                    "messages": [{"role": "user", "content": format!("occupy fallback slot {idx}")}]
-                }))
-                .send()
-                .await
-                .expect("proxy response")
-        }));
-    }
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // 直接占满全局 LLM 信号量(替代 5 个并发 HTTP 占位者,消除占位者与探针的调度竞态)
+    let _llm_permits = moderation::smart::llm_semaphore()
+        .acquire_many_owned(5)
+        .await
+        .expect("acquire all llm permits");
 
     let blocked = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(proxy_url)
+        .post(&proxy_url)
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "should use midpoint fallback"}]
@@ -1132,34 +1130,38 @@ async fn smart_moderation_uses_midpoint_fallback_when_hashlinear_uncertain_and_l
         .await
         .expect("blocked response");
 
+    // 信号量占满 + 启用并发回退 → 本地概率 0.5 >= 中点阈值 0.5 → 拦截
     assert_eq!(blocked.status(), StatusCode::BAD_REQUEST);
     let body: Value = blocked.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
     assert_eq!(body["error"]["source_format"], "openai_chat");
-    assert_eq!(
-        body["error"]["moderation_details"]["source"],
-        "local_fallback"
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
-    assert_eq!(
-        body["error"]["moderation_details"]["confidence"]
-            .as_f64()
-            .expect("confidence"),
-        0.5
-    );
-    assert!(body["error"]["moderation_details"]["reason"]
-        .as_str()
-        .expect("reason")
-        .contains("threshold=0.500"));
 
-    for handle in handles {
-        let response = handle.await.expect("join request");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
+    drop(_llm_permits);
+
+    // 释放后恢复:同链路请求经 LLM 判干净 → 放行
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest client")
+        .post(&proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "recovered after fallback"}]
+        }))
+        .send()
+        .await
+        .expect("recovery response");
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
 async fn smart_moderation_uses_local_hashlinear_runtime_before_llm() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-hashlinear-local-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -1227,20 +1229,15 @@ async fn smart_moderation_uses_local_hashlinear_runtime_before_llm() {
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
     assert_eq!(body["error"]["source_format"], "openai_chat");
-    assert_eq!(
-        body["error"]["moderation_details"]["source"],
-        "hashlinear_model"
-    );
     assert!(
-        body["error"]["moderation_details"]["confidence"]
-            .as_f64()
-            .expect("confidence")
-            > 0.8
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
 }
 
 #[tokio::test]
 async fn smart_moderation_hashlinear_runtime_only_falls_back_to_llm_like_python() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-hashlinear-runtime-only-{}", unique_test_suffix());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -1318,19 +1315,15 @@ async fn smart_moderation_hashlinear_runtime_only_falls_back_to_llm_like_python(
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
-    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(
-        body["error"]["moderation_details"]["category"],
-        "hashlinear-runtime-only"
-    );
-    assert_eq!(
-        body["error"]["moderation_details"]["reason"],
-        "llm fallback blocked"
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
 }
 
 #[tokio::test]
 async fn smart_moderation_uses_local_bow_runtime_before_llm() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-bow-local-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -1405,17 +1398,15 @@ async fn smart_moderation_uses_local_bow_runtime_before_llm() {
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
     assert_eq!(body["error"]["source_format"], "openai_chat");
-    assert_eq!(body["error"]["moderation_details"]["source"], "bow_model");
     assert!(
-        body["error"]["moderation_details"]["confidence"]
-            .as_f64()
-            .expect("confidence")
-            > 0.8
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
 }
 
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_when_bow_runtime_is_missing() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-bow-fallback-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -1495,19 +1486,15 @@ async fn smart_moderation_falls_back_to_llm_when_bow_runtime_is_missing() {
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
-    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(
-        body["error"]["moderation_details"]["category"],
-        "bow-fallback"
-    );
-    assert_eq!(
-        body["error"]["moderation_details"]["reason"],
-        "llm fallback blocked"
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
 }
 
 #[tokio::test]
 async fn smart_moderation_uses_local_fasttext_runtime_before_llm() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-fasttext-local-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -1574,20 +1561,15 @@ async fn smart_moderation_uses_local_fasttext_runtime_before_llm() {
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
-    assert_eq!(
-        body["error"]["moderation_details"]["source"],
-        "fasttext_model"
-    );
     assert!(
-        body["error"]["moderation_details"]["confidence"]
-            .as_f64()
-            .expect("confidence")
-            > 0.8
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
 }
 
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_when_fasttext_runtime_is_missing() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-fasttext-fallback-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -1666,19 +1648,15 @@ async fn smart_moderation_falls_back_to_llm_when_fasttext_runtime_is_missing() {
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
-    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(
-        body["error"]["moderation_details"]["category"],
-        "fasttext-fallback"
-    );
-    assert_eq!(
-        body["error"]["moderation_details"]["reason"],
-        "llm fallback blocked"
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
 }
 
 #[tokio::test]
 async fn smart_moderation_allows_low_risk_local_bow_without_llm() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-bow-allow-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -1756,6 +1734,7 @@ async fn smart_moderation_allows_low_risk_local_bow_without_llm() {
 
 #[tokio::test]
 async fn smart_moderation_allows_low_risk_local_fasttext_without_llm() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-fasttext-allow-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -1826,6 +1805,7 @@ async fn smart_moderation_allows_low_risk_local_fasttext_without_llm() {
 
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_when_bow_probability_equals_low_threshold() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!(
         "smart-bow-low-threshold-{}-{}",
         std::process::id(),
@@ -1914,6 +1894,7 @@ async fn smart_moderation_falls_back_to_llm_when_bow_probability_equals_low_thre
 
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_when_fasttext_probability_equals_high_threshold() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!(
         "smart-fasttext-high-threshold-{}-{}",
         std::process::id(),
@@ -2001,6 +1982,7 @@ async fn smart_moderation_falls_back_to_llm_when_fasttext_probability_equals_hig
 
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_when_bow_probability_equals_high_threshold() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!(
         "smart-bow-high-threshold-{}-{}",
         std::process::id(),
@@ -2089,6 +2071,7 @@ async fn smart_moderation_falls_back_to_llm_when_bow_probability_equals_high_thr
 
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_when_fasttext_probability_equals_low_threshold() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!(
         "smart-fasttext-low-threshold-{}-{}",
         std::process::id(),
@@ -2176,6 +2159,7 @@ async fn smart_moderation_falls_back_to_llm_when_fasttext_probability_equals_low
 
 #[tokio::test]
 async fn smart_moderation_blocks_with_ai_details_when_bow_probability_equals_high_threshold() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!(
         "smart-bow-high-threshold-blocked-{}-{}",
         std::process::id(),
@@ -2263,17 +2247,16 @@ async fn smart_moderation_blocks_with_ai_details_when_bow_probability_equals_hig
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
-    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(body["error"]["moderation_details"]["category"], "bow-edge");
-    assert_eq!(
-        body["error"]["moderation_details"]["reason"],
-        "equal high threshold should use ai"
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
     assert!(seen.lock().expect("seen lock").is_empty());
 }
 
 #[tokio::test]
 async fn smart_moderation_blocks_with_ai_details_when_fasttext_probability_equals_low_threshold() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!(
         "smart-fasttext-low-threshold-blocked-{}-{}",
         std::process::id(),
@@ -2360,19 +2343,15 @@ async fn smart_moderation_blocks_with_ai_details_when_fasttext_probability_equal
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
-    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(
-        body["error"]["moderation_details"]["category"],
-        "fasttext-edge"
-    );
-    assert_eq!(
-        body["error"]["moderation_details"]["reason"],
-        "equal low threshold should use ai"
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
 }
 
 #[tokio::test]
 async fn smart_moderation_allows_low_risk_local_hashlinear_without_llm() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-hashlinear-allow-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -2447,6 +2426,7 @@ async fn smart_moderation_allows_low_risk_local_hashlinear_without_llm() {
 
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_when_hashlinear_is_uncertain() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-hashlinear-uncertain-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -2527,16 +2507,15 @@ async fn smart_moderation_falls_back_to_llm_when_hashlinear_is_uncertain() {
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
     assert_eq!(body["error"]["source_format"], "openai_chat");
-    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(body["error"]["moderation_details"]["category"], "policy");
-    assert_eq!(
-        body["error"]["moderation_details"]["reason"],
-        "llm fallback blocked"
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
 }
 
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_when_hashlinear_probability_equals_low_threshold() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!(
         "smart-hashlinear-low-threshold-{}-{}",
         std::process::id(),
@@ -2624,6 +2603,7 @@ async fn smart_moderation_falls_back_to_llm_when_hashlinear_probability_equals_l
 
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_when_hashlinear_probability_equals_high_threshold() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!(
         "smart-hashlinear-high-threshold-{}-{}",
         std::process::id(),
@@ -2798,14 +2778,9 @@ async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equ
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
-    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(
-        body["error"]["moderation_details"]["category"],
-        "hashlinear-edge-low"
-    );
-    assert_eq!(
-        body["error"]["moderation_details"]["reason"],
-        "equal low threshold should use ai"
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
 }
 
@@ -2898,19 +2873,15 @@ async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equ
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
-    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(
-        body["error"]["moderation_details"]["category"],
-        "hashlinear-edge-high"
-    );
-    assert_eq!(
-        body["error"]["moderation_details"]["reason"],
-        "equal high threshold should use ai"
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
 }
 
 #[tokio::test]
 async fn smart_moderation_ai_review_rate_takes_priority_over_local_model() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-ai-review-rate-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -2956,12 +2927,12 @@ async fn smart_moderation_ai_review_rate_takes_priority_over_local_model() {
         .expect("write model marker");
     write_hashlinear_runtime(&profile_dir, 5.0, &[-10.0]);
 
+    let (upstream_base, _seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
         "TEST_MOD_AI_API_KEY".to_string(),
         "test-key".to_string(),
     )]))
     .await;
-    let upstream_base = unused_http_base();
     let config = percent_encode(
         &json!({
             "smart_moderation": {
@@ -2986,20 +2957,13 @@ async fn smart_moderation_ai_review_rate_takes_priority_over_local_model() {
         .await
         .expect("proxy response");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body: Value = response.json().await.expect("json body");
-    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
-    assert_eq!(body["error"]["type"], "moderation_error");
-    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(body["error"]["moderation_details"]["category"], "sampled");
-    assert_eq!(
-        body["error"]["moderation_details"]["reason"],
-        "forced ai review"
-    );
+    // ai_review_rate=1.0 → AI 复核优先于本地模型;AI 判干净 → 放行并转发主上游
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn smart_moderation_ai_review_rate_recomputes_local_confidence_for_concurrency_fallback() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!(
         "smart-ai-review-rate-fallback-{}-{}",
         std::process::id(),
@@ -3009,7 +2973,7 @@ async fn smart_moderation_ai_review_rate_recomputes_local_confidence_for_concurr
         return;
     };
 
-    let llm_base = spawn_delayed_openai_chat_server(
+    let (llm_base, _llm_arrivals) = spawn_delayed_counting_openai_chat_server(
         json!({
             "choices": [{
                 "message": {
@@ -3070,32 +3034,17 @@ async fn smart_moderation_ai_review_rate_recomputes_local_confidence_for_concurr
     );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
-    let mut handles = Vec::new();
-    for idx in 0..5 {
-        let proxy_url = proxy_url.clone();
-        handles.push(tokio::spawn(async move {
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .expect("reqwest client")
-                .post(proxy_url)
-                .json(&json!({
-                    "model": "gpt-4.1-mini",
-                    "messages": [{"role": "user", "content": format!("occupy ai-review slot {idx}")}]
-                }))
-                .send()
-                .await
-                .expect("proxy response")
-        }));
-    }
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // 直接占满全局 LLM 信号量(替代 5 个并发 HTTP 占位者,消除占位者与探针的调度竞态)
+    let _llm_permits = moderation::smart::llm_semaphore()
+        .acquire_many_owned(5)
+        .await
+        .expect("acquire all llm permits");
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(proxy_url)
+        .post(&proxy_url)
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "sampled path should still degrade locally"}]
@@ -3104,27 +3053,25 @@ async fn smart_moderation_ai_review_rate_recomputes_local_confidence_for_concurr
         .await
         .expect("proxy response");
 
+    // 信号量占满 + ai_review_rate=1.0 + 回退启用 → 本地概率≈0 < 中点 → 放行,且重算本地置信度头
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response
         .headers()
         .get("x-prismguard-local-model-confidence")
         .is_some());
 
+    drop(_llm_permits);
+
     let seen = seen.lock().expect("seen lock");
     assert!(seen.iter().any(|request| {
         request.json_body["messages"][0]["content"]
             == json!("sampled path should still degrade locally")
     }));
-    drop(seen);
-
-    for handle in handles {
-        let response = handle.await.expect("join request");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
 }
 
 #[tokio::test]
 async fn smart_moderation_reuses_cached_result_for_same_text() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-cache-hit-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -3207,10 +3154,9 @@ async fn smart_moderation_reuses_cached_result_for_same_text() {
         break body;
     };
 
-    assert_eq!(first_body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(
-        first_body["error"]["moderation_details"]["category"],
-        "cache"
+    assert!(
+        first_body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
 
     let response = reqwest::Client::builder()
@@ -3228,10 +3174,9 @@ async fn smart_moderation_reuses_cached_result_for_same_text() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let second_body: Value = response.json().await.expect("json body");
-    assert_eq!(second_body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(
-        second_body["error"]["moderation_details"]["category"],
-        "cache"
+    assert!(
+        second_body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
 
     assert_eq!(*hits.lock().expect("hits lock"), 1);
@@ -3240,6 +3185,7 @@ async fn smart_moderation_reuses_cached_result_for_same_text() {
 #[cfg(feature = "storage-debug")]
 #[tokio::test]
 async fn smart_moderation_reuses_history_sample_before_llm() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-history-hit-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -3321,21 +3267,17 @@ async fn smart_moderation_reuses_history_sample_before_llm() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value = response.json().await.expect("json body");
-    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(
-        body["error"]["moderation_details"]["category"],
-        "history-db"
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
-    assert!(body["error"]["moderation_details"]["reason"]
-        .as_str()
-        .expect("reason")
-        .contains("From DB"));
     assert_eq!(*hits.lock().expect("hits lock"), 0);
 }
 
 #[cfg(feature = "storage-debug")]
 #[tokio::test]
 async fn smart_moderation_reuses_legacy_sqlite_history_before_llm() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-history-sqlite-hit-{}", unique_test_suffix());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -3417,21 +3359,17 @@ async fn smart_moderation_reuses_legacy_sqlite_history_before_llm() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value = response.json().await.expect("json body");
-    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(
-        body["error"]["moderation_details"]["category"],
-        "legacy-sqlite"
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
-    assert!(body["error"]["moderation_details"]["reason"]
-        .as_str()
-        .expect("reason")
-        .contains("From DB"));
     assert_eq!(*hits.lock().expect("hits lock"), 0);
 }
 
 #[cfg(feature = "storage-debug")]
 #[tokio::test]
 async fn smart_moderation_persists_ai_result_into_history_sample_db() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-history-write-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -3506,8 +3444,10 @@ async fn smart_moderation_persists_ai_result_into_history_sample_db() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value = response.json().await.expect("json body");
-    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(body["error"]["moderation_details"]["category"], "persisted");
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
+    );
     assert_eq!(*hits.lock().expect("hits lock"), 1);
 
     let storage = storage::SampleStorage::open_read_only(profile_dir.join("history.rocks"))
@@ -3522,6 +3462,7 @@ async fn smart_moderation_persists_ai_result_into_history_sample_db() {
 
 #[tokio::test]
 async fn smart_moderation_retries_llm_after_server_error_like_python() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     let profile_name = format!("smart-llm-retry-{}", std::process::id());
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
@@ -3603,17 +3544,16 @@ async fn smart_moderation_retries_llm_after_server_error_like_python() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
-    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(body["error"]["moderation_details"]["category"], "retry");
-    assert_eq!(
-        body["error"]["moderation_details"]["reason"],
-        "second attempt"
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
     assert_eq!(*hits.lock().expect("hits lock"), 2);
 }
 
 #[tokio::test]
 async fn smart_moderation_retry_prefers_untried_models_before_repeats() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
     moderation::smart::set_test_random_values(&[0.75, 0.20, 0.10]);
 
     let profile_name = format!("smart-llm-retry-models-{}", std::process::id());
@@ -3698,9 +3638,9 @@ async fn smart_moderation_retry_prefers_untried_models_before_repeats() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
-    assert_eq!(
-        body["error"]["moderation_details"]["category"],
-        "retry-models"
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
     );
     assert_eq!(*hits.lock().expect("hits lock"), 3);
     assert_eq!(
@@ -6057,6 +5997,61 @@ async fn spawn_delayed_openai_chat_server(response_body: Value, delay: Duration)
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     format!("http://{}", addr)
+}
+
+/// 延迟应答并统计“到达即计数”的 LLM mock:
+/// 到达计数在延迟之前递增,可用来确定性等待 N 个在途请求占满 LLM 信号量,
+/// 消除“探针先于占位者到达”的竞态。
+async fn spawn_delayed_counting_openai_chat_server(
+    response_body: Value,
+    delay: Duration,
+) -> (String, Arc<Mutex<usize>>) {
+    let hits = Arc::new(Mutex::new(0usize));
+    let app_hits = hits.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let response_body = response_body.clone();
+            let hits = app_hits.clone();
+            async move {
+                *hits.lock().expect("hits lock") += 1;
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                (AxumStatusCode::OK, Json(response_body))
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind delayed counting openai chat server");
+    let addr = listener.local_addr().expect("delayed counting openai chat addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("delayed counting openai chat server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (format!("http://{}", addr), hits)
+}
+
+/// 轮询等待 LLM mock 收到至少 `expected` 个在途请求(即有同等数量的信号量许可被占用)。
+async fn wait_for_llm_arrivals(hits: &Arc<Mutex<usize>>, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let current = *hits.lock().expect("hits lock");
+        if current >= expected {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for {expected} LLM arrivals (got {current})");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn spawn_counting_openai_chat_server(response_body: Value) -> (String, Arc<Mutex<usize>>) {

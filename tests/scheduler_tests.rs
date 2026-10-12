@@ -20,9 +20,8 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sample_rpc::{
-    serve_unix_requests_until_shutdown, SampleRpcRequest, SampleRpcResponse,
-};
+#[cfg(unix)]
+use sample_rpc::{SampleRpcRequest, SampleRpcResponse, serve_unix_requests_until_shutdown};
 
 fn env_test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -211,6 +210,7 @@ fn scheduler_skips_profile_when_training_is_already_running() {
     assert!(!decision);
 }
 
+#[cfg(unix)]
 #[test]
 fn scheduler_spawn_detached_command_returns_before_child_exits() {
     let started = Instant::now();
@@ -227,6 +227,7 @@ fn scheduler_spawn_detached_command_returns_before_child_exits() {
     std::thread::sleep(Duration::from_millis(1200));
 }
 
+#[cfg(unix)]
 #[test]
 fn scheduler_command_uses_single_core_systemd_scope() {
     let root_dir = repo_root();
@@ -251,6 +252,7 @@ fn scheduler_command_uses_single_core_systemd_scope() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn scheduler_run_once_trains_only_eligible_profiles() {
     let root_dir = PathBuf::from(format!(
@@ -343,6 +345,7 @@ async fn scheduler_run_once_trains_only_eligible_profiles() {
     std::fs::remove_dir_all(&root_dir).expect("cleanup root");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn scheduler_plan_round_skips_profiles_with_unreadable_history_storage() {
     let root_dir = PathBuf::from(format!(
