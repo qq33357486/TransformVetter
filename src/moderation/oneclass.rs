@@ -94,6 +94,9 @@ pub struct OneClassScore {
     pub baseline_group: String,
     /// 实际参与打分的窗数(空文本为 0)。
     pub window_count: usize,
+    /// 最异常窗的字符区间 [start, end)(全文坐标;空文本为 None)。
+    /// 供截断逻辑把"中段"对准最异常区段,避免中段藏毒被截掉。
+    pub anomaly_window: Option<(usize, usize)>,
 }
 
 pub fn model_path(profile: &ModerationProfile) -> PathBuf {
@@ -128,10 +131,11 @@ pub fn score_request(
             normalized_score: 1.0,
             baseline_group: "empty".to_string(),
             window_count: 0,
+            anomaly_window: None,
         }));
     }
 
-    let raw_score = score_windows(text, &model, max_scan);
+    let (raw_score, anomaly_window) = score_windows(text, &model, max_scan);
     let (normalized, group) =
         normalize_with_baseline(raw_score, model_name, &profile.config.oneclass.baselines);
     Ok(Some(OneClassScore {
@@ -139,24 +143,62 @@ pub fn score_request(
         normalized_score: normalized,
         baseline_group: group,
         window_count,
+        anomaly_window,
     }))
 }
 
-/// 计算请求级原始分:所有窗中最小的余弦(最异常窗)。
-fn score_windows(text: &str, model: &OneClassModel, max_scan_chars: usize) -> f64 {
+/// 计算请求级原始分:所有窗中最小的余弦(最异常窗),并返回该窗的
+/// 字符区间(供截断逻辑定位中段)。
+fn score_windows(
+    text: &str,
+    model: &OneClassModel,
+    max_scan_chars: usize,
+) -> (f64, Option<(usize, usize)>) {
     let chars: Vec<char> = text.chars().take(max_scan_chars).collect();
     let mut min_cosine = f64::MAX;
+    let mut best: Option<(usize, usize)> = None;
+    let mut offset = 0usize;
     for window in iter_windows(&chars, model.window_chars) {
-        let counts = window_counts(window, model);
+        let counts = window_counts(window, &model);
         let cosine = cosine_with_centroid(&counts, model);
         if cosine < min_cosine {
             min_cosine = cosine;
+            best = Some((offset, offset + window.len()));
         }
+        offset += window.len();
     }
     if min_cosine == f64::MAX {
-        1.0
+        (1.0, best)
     } else {
-        min_cosine
+        (min_cosine, best)
+    }
+}
+
+/// 最异常窗(余弦最小的滑窗)的字符区间 [start, end)(相对全文,UTF-8 安全:
+/// 下标按 char 计)。模型缺失/空文本(无窗)返回 None。
+///
+/// 用途:truncate_text 的中段定位——长文本截断时优先保留被判为最异常的
+/// 区段,避免"中段藏毒被整体截掉"(研究实测 30K 头尾截断下中段藏毒
+/// glm 复核只拦 17.4%)。
+fn most_anomalous_window_range(
+    text: &str,
+    profile: &ModerationProfile,
+) -> Result<Option<(usize, usize)>> {
+    let Some(model) = load_model(profile)? else {
+        return Ok(None);
+    };
+    let (_, range) = score_windows(text, &model, profile.config.oneclass.max_scan_chars);
+    Ok(range)
+}
+
+/// 最异常窗的中心字符下标(全文坐标)。None = 模型缺失/无窗,调用方回退中点。
+pub fn most_anomalous_window_center(
+    text: &str,
+    profile: &ModerationProfile,
+) -> Option<usize> {
+    match most_anomalous_window_range(text, profile) {
+        Ok(Some((start, end))) => Some((start + end) / 2),
+        _ => None,
     }
 }
 
@@ -405,10 +447,24 @@ mod tests {
 
     fn unique_profile() -> ModerationProfile {
         use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
         static NEXT: AtomicU32 = AtomicU32::new(0);
+        // 命名必须跨运行唯一:早期版本用 pid+自增 id,Windows pid 回卷后
+        // 会命中上次运行遗留的目录,把"无模型"用例变成"读到陈旧模型"
+        // (本地实测 366 个遗留目录时连续翻车)。此处加进程启动时间戳,
+        // 并对同名遗留目录做防御性清理。
+        static RUN_STAMP: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+        let stamp = *RUN_STAMP.get_or_init(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        });
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!("oneclass-test-{}-{}", std::process::id(), id));
-        std::fs::create_dir_all(&base).expect("create profile dir");
+        let base =
+            std::env::temp_dir().join(format!("oneclass-test-{stamp}-{id}"));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create profile dir");
         ModerationProfile {
             profile_name: format!("oneclass-{id}"),
             base_dir: base,
@@ -645,5 +701,56 @@ mod tests {
             .expect("model");
         assert_eq!(score.raw_score, 1.0);
         assert_eq!(score.window_count, 0);
+        assert_eq!(score.anomaly_window, None);
+    }
+
+    #[test]
+    fn most_anomalous_window_lands_on_alien_segment() {
+        // 截断修复的定位来源:最异常窗必须落在远离中点的异质段上,
+        // 且独立查询接口与 score_request 的结果一致。
+        let profile = unique_profile();
+        let mut json = toy_model_json();
+        let normal_unit = "normal chat about weather and code ".repeat(7); // 245 chars
+        set_centroid_for_text(&mut json, &normal_unit);
+        json["window_chars"] = serde_json::json!(40);
+        write_model(&profile, &json);
+
+        // 全文除异质段外都用正常模式连续填充:单字符填充(如 'n'/'k' 重复)
+        // 自身的 gram 分布与质心正交,会形成一个"假最异常窗"干扰断言
+        let normal_filler: String = normal_unit.chars().cycle().take(258).collect();
+        let mut text = normal_filler;
+        let alien: String = "zqxjwv-".repeat(14).chars().take(92).collect();
+        text.push_str(&alien); // 258..350:异质段(中点窗 180..220 之外)
+        let normal_tail: String = normal_unit.chars().cycle().take(50).collect();
+        text.push_str(&normal_tail); // 350..400
+        assert_eq!(text.chars().count(), 400);
+
+        let score = score_request(&text, "m", &profile)
+            .expect("score")
+            .expect("model");
+        let (start, end) = score
+            .anomaly_window
+            .expect("anomaly window for multi-window text");
+        assert!(
+            end > 258 && start < 350,
+            "window {start}..{end} must intersect the alien segment 258..350"
+        );
+        let center = (start + end) / 2;
+        assert!(
+            (258..=350).contains(&center),
+            "window center {center} should sit inside the alien segment"
+        );
+        // 独立接口(供现状 smart 链定位)与打分结果一致
+        assert_eq!(
+            most_anomalous_window_center(&text, &profile),
+            Some(center)
+        );
+
+        // 短文本(单窗):区间就是整段文本
+        let short = "normal chat about weather";
+        let short_score = score_request(short, "m", &profile)
+            .expect("score")
+            .expect("model");
+        assert_eq!(short_score.anomaly_window, Some((0, short.chars().count())));
     }
 }

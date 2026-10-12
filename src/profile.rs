@@ -483,26 +483,43 @@ impl ModerationProfile {
         template
     }
 
+    /// 长文本截断(中段取全文中点)。见 [truncate_text_with_center]。
     pub fn truncate_text(&self, text: &str) -> String {
+        self.truncate_text_with_center(text, None)
+    }
+
+    /// 长文本截断:头 max/2 + 中段 max/3 + 尾 max/6(30K 配置下即 15K+10K+5K)。
+    ///
+    /// 旧实现是"头 2/3 + 尾 1/3",中段藏毒会被整体丢掉(可行性研究实测:
+    /// 30K 头尾截断下中段藏毒 glm 复核只拦 17.4%)。新实现保留中段。
+    /// `center_hint` 为中段中心字符下标:调用方(oneclass 三态链)传入
+    /// 滑窗判定的最异常窗中心,让复核优先看到"最不像正常流量"的区段;
+    /// None(模型缺失/无信号/旧链路)回退全文中点。三段拼接处沿用
+    /// "...[中间省略]..." 分隔符,复核提示词已说明该拼接结构。
+    pub fn truncate_text_with_center(&self, text: &str, center_hint: Option<usize>) -> String {
         let max_len = self.config.prompt.max_text_length;
-        if text.chars().count() <= max_len {
+        let chars = text.chars().collect::<Vec<_>>();
+        if chars.len() <= max_len {
             return text.to_string();
         }
 
-        let front_len = max_len.saturating_mul(2) / 3;
-        let back_len = max_len.saturating_sub(front_len);
-        let chars = text.chars().collect::<Vec<_>>();
-        let front = chars.iter().take(front_len).collect::<String>();
-        let back = chars
+        let head_len = max_len / 2;
+        let middle_len = max_len / 3;
+        let tail_len = max_len - head_len - middle_len; // 余数归尾段,三段之和恒等于 max_len
+        let total = chars.len();
+        let mid_half = middle_len / 2;
+
+        // clamp 保证中段落在 [head_len, total - tail_len) 内,不与头尾重叠
+        let lower = head_len + mid_half;
+        let upper = (total - tail_len - middle_len + mid_half).max(lower);
+        let center = center_hint.unwrap_or(total / 2).clamp(lower, upper);
+
+        let head: String = chars[..head_len].iter().collect();
+        let middle: String = chars[(center - mid_half)..(center - mid_half + middle_len)]
             .iter()
-            .rev()
-            .take(back_len)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<String>();
-        format!("{front}\n...[中间省略]...\n{back}")
+            .collect();
+        let tail: String = chars[(total - tail_len)..].iter().collect();
+        format!("{head}\n...[中间省略]...\n{middle}\n...[中间省略]...\n{tail}")
     }
 
     pub fn render_prompt(&self, text: &str) -> String {
@@ -724,4 +741,172 @@ fn default_oneclass_divert_threshold() -> f64 {
 }
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 截断后三段拼接的分隔符字符数("\n...[中间省略]...\n")。
+    const SEPARATOR_CHARS: usize = 14;
+
+    fn unique_profile(max_len: usize) -> ModerationProfile {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        // 跨运行唯一命名(时间戳+自增),避免命中上次运行遗留的同名目录;
+        // 同名遗留目录做防御性清理(oneclass.rs 测试同款坑)
+        static RUN_STAMP: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+        let stamp = *RUN_STAMP.get_or_init(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        });
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut config = ProfileConfig::default();
+        config.prompt.max_text_length = max_len;
+        let base_dir =
+            std::env::temp_dir().join(format!("tv-profile-truncate-{stamp}-{id}"));
+        let _ = fs::remove_dir_all(&base_dir);
+        fs::create_dir_all(&base_dir).expect("create profile dir");
+        ModerationProfile {
+            profile_name: format!("truncate-{id}"),
+            base_dir,
+            config,
+        }
+    }
+
+    fn pad_until(text: &mut String, fill: char, target_chars: usize) {
+        while text.chars().count() < target_chars {
+            text.push(fill);
+        }
+    }
+
+    #[test]
+    fn truncate_text_keeps_short_text_unchanged() {
+        let profile = unique_profile(90);
+        let text = "short text stays as is, no truncation applied";
+        assert_eq!(profile.truncate_text(text), text);
+        // 恰好等于上限也不截断
+        let exact: String = "x".repeat(90);
+        assert_eq!(profile.truncate_text(&exact), exact);
+    }
+
+    #[test]
+    fn truncate_text_keeps_head_midpoint_and_tail_segments() {
+        // max_len=90 → 头45 + 中段30 + 尾15;全文 300 字符,无 oneclass 模型
+        // → 中段取中点(150),覆盖 135..165。
+        let profile = unique_profile(90);
+        let mut text = String::from("HEADMARK-");
+        pad_until(&mut text, 'a', 146);
+        text.push_str("MIDMARK"); // 146..153,落在中点窗 135..165 内
+        pad_until(&mut text, 'b', 196);
+        text.push_str("DROPMARK"); // 196..204,落在丢弃区(165..285)
+        pad_until(&mut text, 'c', 292);
+        text.push_str("TAILMARK"); // 292..300,落在尾段 285..300 内
+        assert_eq!(text.chars().count(), 300);
+
+        let truncated = profile.truncate_text(&text);
+        for marker in ["HEADMARK", "MIDMARK", "TAILMARK"] {
+            assert!(
+                truncated.contains(marker),
+                "truncated output must contain {marker}"
+            );
+        }
+        assert!(
+            !truncated.contains("DROPMARK"),
+            "marker in dropped zone must not survive: {truncated}"
+        );
+        // 三段之和 == max_len,外加两个分隔符
+        assert_eq!(
+            truncated.chars().count(),
+            90 + 2 * SEPARATOR_CHARS,
+            "unexpected truncated length"
+        );
+        assert_eq!(
+            truncated.matches("...[中间省略]...").count(),
+            2,
+            "expected exactly two omission separators"
+        );
+    }
+
+    #[test]
+    fn truncate_text_prefers_center_hint_over_midpoint() {
+        // max_len=120 → 头60 + 中段40 + 尾20;全文 400 字符。
+        // 中点中段覆盖 180..220;异质段在 258..350,中点定位会整体丢弃。
+        let profile = unique_profile(120);
+
+        let normal_unit = "normal chat about weather and code "; // 35 chars
+        let mut text = normal_unit.repeat(7); // 245 chars
+        pad_until(&mut text, 'n', 258);
+        let alien: String = "zqxjwv-".repeat(14).chars().take(92).collect();
+        text.push_str(&alien); // 258..350:异质段(远离中点窗)
+        pad_until(&mut text, 'k', 400);
+        assert_eq!(text.chars().count(), 400);
+
+        // center_hint = 最异常窗中心(模拟 oneclass 定位到异质段,如窗
+        // 280..320 的中心 300):中段随之移动,异质内容必须保留。
+        let truncated = profile.truncate_text_with_center(&text, Some(300));
+        assert!(
+            truncated.contains("zqxjwv"),
+            "anomaly-centered middle segment must keep the anomalous content"
+        );
+        assert!(
+            truncated.starts_with("normal"),
+            "head segment must be the text head"
+        );
+        assert_eq!(
+            truncated.chars().count(),
+            120 + 2 * SEPARATOR_CHARS,
+            "unexpected truncated length"
+        );
+
+        // 中点回退(对照):中段 180..220 不含异质段(258..350),必须被
+        // 整体丢弃——证明上一步的保留来自 center_hint,而非段本身够长。
+        let midpoint_truncated = profile.truncate_text(&text);
+        assert!(
+            !midpoint_truncated.contains("zqxjwv"),
+            "midpoint fallback must drop the off-center anomaly"
+        );
+    }
+
+    #[test]
+    fn truncate_text_clamps_center_hint_into_head_tail_gap() {
+        // center_hint 指向头段内部或越界:中段必须被夹回 [head, total-tail) 区间,
+        // 不与头尾重叠,也不越界 panic。
+        let profile = unique_profile(120);
+        let text = "x".repeat(400);
+        for hint in [0, 10, 59, 400, 10_000] {
+            let truncated = profile.truncate_text_with_center(&text, Some(hint));
+            assert_eq!(
+                truncated.chars().count(),
+                120 + 2 * SEPARATOR_CHARS,
+                "hint={hint} must still produce exactly head+middle+tail"
+            );
+            assert_eq!(
+                truncated.matches("...[中间省略]...").count(),
+                2,
+                "hint={hint} must keep two separators"
+            );
+        }
+        // hint 指向头段内(10)→ clamp 到下界,中段从 head 开始
+        let clamped = profile.truncate_text_with_center(&text, Some(10));
+        let parts: Vec<&str> = clamped.split("\n...[中间省略]...\n").collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].chars().count(), 60, "head is 60 chars");
+        assert_eq!(parts[1].chars().count(), 40, "middle is 40 chars");
+        assert_eq!(parts[2].chars().count(), 20, "tail is 20 chars");
+    }
+
+    #[test]
+    fn truncate_handles_multibyte_text_without_panicking() {
+        // 全中文(多字节)长文本:截断按 char 计数,不得 panic 且尾段保留
+        let profile = unique_profile(30);
+        let mut text: String = "长".repeat(10_000);
+        text.push_str("标记中文"); // 最后 4 字符,必落在尾段(尾段=5 字符)
+        let truncated = profile.truncate_text(&text);
+        assert!(truncated.contains("标记中文"));
+        assert!(truncated.chars().count() <= 30 + 2 * SEPARATOR_CHARS);
+    }
 }
