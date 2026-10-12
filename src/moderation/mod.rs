@@ -3,6 +3,7 @@ pub mod bow;
 pub mod extract;
 pub mod fasttext;
 pub mod hashlinear;
+pub mod oneclass;
 pub mod smart;
 
 /// 对外统一拦截文案:不区分拦截层、不含类别与命中词,避免向调用方提供

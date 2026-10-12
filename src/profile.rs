@@ -266,6 +266,58 @@ impl Default for HashLinearTrainingConfig {
     }
 }
 
+/// one-class 滑窗打分的按模型名前缀分组的基线分位。
+/// normalized = (raw - p05) / (p50 - p05):组内最异常 5% 分位→0,中位→1,越高越合规。
+/// prefix 为 "*" 时表示全局缺省组。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OneClassBaseline {
+    pub prefix: String,
+    #[serde(default)]
+    pub p05: f64,
+    #[serde(default)]
+    pub p50: f64,
+}
+
+/// 商业化路由的 one-class 决策配置(全部带默认值,不硬编码)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OneClassConfig {
+    /// 模型文件名(相对 profile 目录)。
+    #[serde(default = "default_oneclass_model_file")]
+    pub model_file: String,
+    /// 参与打分的最大字符数(头部长度截断,防超长请求拖垮 CPU)。
+    #[serde(default = "default_oneclass_max_scan_chars")]
+    pub max_scan_chars: usize,
+    /// normalized score < block_threshold → 拦截(宁漏切勿误切,默认只拦极端异常)。
+    #[serde(default = "default_oneclass_block_threshold")]
+    pub block_threshold: f64,
+    /// block_threshold <= score < divert_threshold → 存疑,走次级上游。
+    #[serde(default = "default_oneclass_divert_threshold")]
+    pub divert_threshold: f64,
+    /// 按模型名前缀分组的基线分位表(缺省组用 prefix="*")。
+    #[serde(default)]
+    pub baselines: Vec<OneClassBaseline>,
+    /// glm 复核基础采样率(0~1,默认 0 = 不采样,灰度期零成本)。
+    #[serde(default)]
+    pub review_base_rate: f64,
+    /// 高危模型线前缀列表:命中即强制送 glm 复核(优先于基础采样率)。
+    #[serde(default)]
+    pub review_forced_model_prefixes: Vec<String>,
+}
+
+impl Default for OneClassConfig {
+    fn default() -> Self {
+        Self {
+            model_file: default_oneclass_model_file(),
+            max_scan_chars: default_oneclass_max_scan_chars(),
+            block_threshold: default_oneclass_block_threshold(),
+            divert_threshold: default_oneclass_divert_threshold(),
+            baselines: Vec::new(),
+            review_base_rate: 0.0,
+            review_forced_model_prefixes: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileConfig {
     #[serde(default)]
@@ -282,6 +334,8 @@ pub struct ProfileConfig {
     pub fasttext_training: FastTextTrainingConfig,
     #[serde(default)]
     pub hashlinear_training: HashLinearTrainingConfig,
+    #[serde(default)]
+    pub oneclass: OneClassConfig,
 }
 
 impl Default for ProfileConfig {
@@ -294,6 +348,7 @@ impl Default for ProfileConfig {
             bow_training: BowTrainingConfig::default(),
             fasttext_training: FastTextTrainingConfig::default(),
             hashlinear_training: HashLinearTrainingConfig::default(),
+            oneclass: OneClassConfig::default(),
         }
     }
 }
@@ -650,6 +705,22 @@ fn default_hashlinear_batch_size() -> usize {
 }
 fn default_local_model_type() -> String {
     "bow".to_string()
+}
+fn default_oneclass_model_file() -> String {
+    "oneclass_model.json".to_string()
+}
+fn default_oneclass_max_scan_chars() -> usize {
+    400_000
+}
+/// 默认只拦"比所在基线组最异常 5% 分位还要低半个组距"的极端请求
+/// (normalized -0.5);未配基线表时等价于原始余弦 < -0.5,基本不可能触发,
+/// 即"没配好基线就不拦",符合宁漏切勿误切。
+fn default_oneclass_block_threshold() -> f64 {
+    -0.5
+}
+/// 默认存疑线 = 组内最异常 5% 分位(normalized 0):约 top5% 异常流量走次级上游。
+fn default_oneclass_divert_threshold() -> f64 {
+    0.0
 }
 fn default_true() -> bool {
     true

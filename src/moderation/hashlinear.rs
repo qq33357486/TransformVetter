@@ -347,7 +347,7 @@ fn sigmoid(x: f64) -> f64 {
     }
 }
 
-fn murmurhash3_x86_32(data: &[u8], seed: u32) -> i32 {
+pub(crate) fn murmurhash3_x86_32(data: &[u8], seed: u32) -> i32 {
     const C1: u32 = 0xCC9E2D51;
     const C2: u32 = 0x1B87_3593;
 
