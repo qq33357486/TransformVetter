@@ -18,6 +18,7 @@ use tokio::time::timeout as tokio_timeout;
 use crate::moderation::bow;
 use crate::moderation::fasttext;
 use crate::moderation::hashlinear;
+use crate::moderation::oneclass;
 use crate::profile::ModerationProfile;
 #[cfg(feature = "storage-debug")]
 use crate::storage::SampleStorage;
@@ -147,6 +148,239 @@ pub enum SmartModerationError {
 impl From<anyhow::Error> for SmartModerationError {
     fn from(value: anyhow::Error) -> Self {
         Self::Other(value, None)
+    }
+}
+
+/// 三态路由结论:拦截 / 存疑走次级上游 / 合规走主上游。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModerationRoute {
+    Block,
+    Divert,
+    Allow,
+}
+
+impl ModerationRoute {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModerationRoute::Block => "block",
+            ModerationRoute::Divert => "divert",
+            ModerationRoute::Allow => "allow",
+        }
+    }
+}
+
+/// 商业化路由的一次完整决策(one-class 打分 + glm 复核采样)。
+#[derive(Debug, Clone)]
+pub struct RouteDecision {
+    pub route: ModerationRoute,
+    /// 归一化后的 oneclass 分(越高越合规)。
+    pub score: f64,
+    /// 最异常窗原始余弦分。
+    pub raw_score: f64,
+    /// 命中的基线分组。
+    pub baseline_group: String,
+    /// 请求模型名(用于采样与基线)。
+    pub model_name: String,
+    /// 是否真的送了 glm 复核。
+    pub llm_reviewed: bool,
+    pub debug: ModerationDebugInfo,
+}
+
+/// 三态决策链(词库层由调用方先行,此处从 oneclass 打分开始):
+/// - score < block_threshold 或 glm 判违规 → 拦截
+/// - block_threshold <= score < divert_threshold → 存疑(次级上游)
+/// - score >= divert_threshold → 合规(主上游)
+/// glm 复核按 `review_base_rate` 基础采样 + 高危模型前缀强制采样;
+/// 复核失败只记日志不改变路由(可用性优先,风险由采样审计兜底)。
+///
+/// 返回 Ok(None) 表示 oneclass 模型不可用(文件缺失/损坏):
+/// 调用方应降级为现状 smart_moderation 决策链,不影响可用性。
+pub async fn route_moderation(
+    text: &str,
+    model_name: &str,
+    cfg: &Value,
+    root_dir: &Path,
+    http_client: &Client,
+    env_map: &HashMap<String, String>,
+) -> Result<Option<RouteDecision>, SmartModerationError> {
+    if !cfg.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(None);
+    }
+
+    let profile_name = cfg
+        .get("profile")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    let profile = ModerationProfile::load(root_dir, profile_name)?;
+
+    // oneclass 用全文(不截断)——中段藏毒正是截断漏洞,滑窗必须覆盖
+    let Some(score) = oneclass::score_request(text, model_name, &profile)? else {
+        return Ok(None);
+    };
+
+    let oneclass_cfg = &profile.config.oneclass;
+    let block_threshold = oneclass_cfg.block_threshold;
+    // 阈值配反时兜底:存疑线不能低于拦截线
+    let divert_threshold = oneclass_cfg
+        .divert_threshold
+        .max(block_threshold);
+
+    let mut llm_reviewed = false;
+    let mut llm_result: Option<String> = None;
+
+    if score.normalized_score < block_threshold {
+        // 极端异常直接拦截,无需 glm 确认(规则与 glm 违规是"或"的关系)
+        tracing::info!(
+            model = %model_name,
+            score = score.normalized_score,
+            raw_score = score.raw_score,
+            baseline_group = %score.baseline_group,
+            block_threshold,
+            windows = score.window_count,
+            "oneclass route: block"
+        );
+        return Ok(Some(RouteDecision {
+            route: route_for_score(score.normalized_score, block_threshold, divert_threshold),
+            score: score.normalized_score,
+            raw_score: score.raw_score,
+            baseline_group: score.baseline_group,
+            model_name: model_name.to_string(),
+            llm_reviewed: false,
+            debug: ModerationDebugInfo {
+                local_model_source: Some("oneclass_model".to_string()),
+                local_model_confidence: Some(score.normalized_score),
+                local_model_decision: Some("block".to_string()),
+                ..Default::default()
+            },
+        }));
+    }
+
+    if should_review_model(model_name, oneclass_cfg) {
+        // glm 复核:用截断文本(与现状一致);结论只可能把路由推向拦截
+        let truncated = profile.truncate_text(text);
+        let verdict = if let Some(cached) = check_cache(profile_name, &truncated) {
+            Some(cached)
+        } else {
+            match run_ai_moderation_with_history(
+                &truncated,
+                &profile,
+                http_client,
+                env_map,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(result) => {
+                    save_cache(profile_name, &truncated, &result);
+                    Some(result)
+                }
+                Err(err) => {
+                    // 复核是抽检,失败不阻断业务:按分数继续路由,错误进日志
+                    let message = match &err {
+                        SmartModerationError::ConcurrencyLimit(message) => message.clone(),
+                        SmartModerationError::Other(error, _) => format!("{error:#}"),
+                    };
+                    tracing::warn!(
+                        model = %model_name,
+                        score = score.normalized_score,
+                        error = %message,
+                        "oneclass route: glm review failed; continuing by score"
+                    );
+                    None
+                }
+            }
+        };
+
+        if let Some(result) = verdict {
+            llm_reviewed = true;
+            llm_result = Some(if result.violation { "block" } else { "allow" }.to_string());
+            if result.violation {
+                tracing::info!(
+                    model = %model_name,
+                    score = score.normalized_score,
+                    "oneclass route: block by glm review"
+                );
+                return Ok(Some(RouteDecision {
+                    route: ModerationRoute::Block,
+                    score: score.normalized_score,
+                    raw_score: score.raw_score,
+                    baseline_group: score.baseline_group,
+                    model_name: model_name.to_string(),
+                    llm_reviewed,
+                    debug: ModerationDebugInfo {
+                        local_model_source: Some("oneclass_model".to_string()),
+                        local_model_confidence: Some(score.normalized_score),
+                        local_model_decision: Some("uncertain".to_string()),
+                        llm_reviewed,
+                        llm_result,
+                        ..Default::default()
+                    },
+                }));
+            }
+        }
+    }
+
+    let route = route_for_score(score.normalized_score, block_threshold, divert_threshold);
+    tracing::info!(
+        model = %model_name,
+        route = route.as_str(),
+        score = score.normalized_score,
+        raw_score = score.raw_score,
+        baseline_group = %score.baseline_group,
+        divert_threshold,
+        windows = score.window_count,
+        llm_reviewed,
+        "oneclass route decision"
+    );
+    Ok(Some(RouteDecision {
+        route,
+        score: score.normalized_score,
+        raw_score: score.raw_score,
+        baseline_group: score.baseline_group,
+        model_name: model_name.to_string(),
+        llm_reviewed,
+        debug: ModerationDebugInfo {
+            local_model_source: Some("oneclass_model".to_string()),
+            local_model_confidence: Some(score.normalized_score),
+            local_model_decision: Some(route.as_str().to_string()),
+            llm_reviewed,
+            llm_result,
+            ..Default::default()
+        },
+    }))
+}
+
+/// glm 复核采样:高危模型前缀强制(大小写不敏感前缀匹配),
+/// 否则按基础采样率抽签。
+fn should_review_model(model_name: &str, cfg: &crate::profile::OneClassConfig) -> bool {
+    let lowered = model_name.to_ascii_lowercase();
+    if cfg
+        .review_forced_model_prefixes
+        .iter()
+        .any(|prefix| !prefix.is_empty() && lowered.starts_with(&prefix.to_ascii_lowercase()))
+    {
+        return true;
+    }
+    let rate = cfg.review_base_rate;
+    if rate <= 0.0 {
+        return false;
+    }
+    if rate >= 1.0 {
+        return true;
+    }
+    next_random_unit() < rate
+}
+
+/// 三态边界(规格原文):
+/// score < block → Block;block <= score < divert → Divert;score >= divert → Allow。
+fn route_for_score(score: f64, block_threshold: f64, divert_threshold: f64) -> ModerationRoute {
+    if score < block_threshold {
+        ModerationRoute::Block
+    } else if score < divert_threshold {
+        ModerationRoute::Divert
+    } else {
+        ModerationRoute::Allow
     }
 }
 
@@ -1019,5 +1253,59 @@ mod tests {
 
         assert!(result.is_none());
         assert_eq!(debug.local_model_decision.as_deref(), Some("skipped"));
+    }
+
+    #[test]
+    fn route_for_score_covers_three_state_boundaries() {
+        use super::{route_for_score, ModerationRoute};
+        let block = -0.5_f64;
+        let divert = 0.0_f64;
+
+        // score < block → 拦截
+        assert_eq!(
+            route_for_score(-0.5 - f64::EPSILON, block, divert),
+            ModerationRoute::Block
+        );
+        // score == block 恰好落在存疑区间(开区间下界)
+        assert_eq!(route_for_score(block, block, divert), ModerationRoute::Divert);
+        // 区间中段 → 存疑
+        assert_eq!(route_for_score(-0.25, block, divert), ModerationRoute::Divert);
+        // score == divert 恰好合规(闭区间上界)
+        assert_eq!(route_for_score(divert, block, divert), ModerationRoute::Allow);
+        assert_eq!(route_for_score(1.7, block, divert), ModerationRoute::Allow);
+
+        // 阈值配反时(divert < block)由调用方 max() 兜底;纯函数语义仍按传入值判定
+        assert_eq!(
+            route_for_score(-0.6, 0.0, -1.0),
+            ModerationRoute::Block,
+            "score below block still blocks even if thresholds are inverted"
+        );
+    }
+
+    #[test]
+    fn review_sampling_forced_prefixes_and_base_rate() {
+        use super::should_review_model;
+        use crate::profile::OneClassConfig;
+
+        let mut cfg = OneClassConfig::default();
+        cfg.review_base_rate = 0.0;
+        cfg.review_forced_model_prefixes = vec!["Claude-Opus".to_string(), "grok".to_string()];
+
+        // 高危前缀强制,大小写不敏感
+        assert!(should_review_model("claude-opus-4-5", &cfg));
+        assert!(should_review_model("GROK-4-FAST", &cfg));
+        // 非高危 + 基础采样率 0 → 不采样
+        assert!(!should_review_model("gpt-4.1-mini", &cfg));
+
+        // 基础采样率生效:抽签值低于阈值才采样
+        cfg.review_forced_model_prefixes.clear();
+        cfg.review_base_rate = 0.5;
+        set_test_random_values(&[0.4, 0.6]);
+        assert!(should_review_model("gpt-4.1-mini", &cfg));
+        assert!(!should_review_model("gpt-4.1-mini", &cfg));
+
+        // 采样率 >= 1 全量
+        cfg.review_base_rate = 1.0;
+        assert!(should_review_model("any-model", &cfg));
     }
 }
