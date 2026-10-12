@@ -294,7 +294,7 @@ async fn proxy_entry_with_cfg(
                             route = smart::ModerationRoute::Block.as_str(),
                             model = %decision.model_name,
                             score = decision.score,
-                            raw_score = decision.raw_score,
+                            raw_anomaly = decision.raw_anomaly,
                             baseline_group = %decision.baseline_group,
                             llm_reviewed = decision.llm_reviewed,
                             "commercial router blocked request"

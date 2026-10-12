@@ -5894,8 +5894,8 @@ async fn commercial_router_shadow_mode_marks_divert_but_stays_on_primary() {
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
     };
-    // 任意分数必落存疑区间: block < score < divert
-    write_commercial_profile(&profile_dir, -100.0, 100.0);
+    // anomaly 取向:任何分数都落存疑档(divert=-100 必越,block=100 不可达)
+    write_commercial_profile(&profile_dir, 100.0, -100.0);
     write_minimal_oneclass_model(&profile_dir);
 
     let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
@@ -5933,7 +5933,7 @@ async fn commercial_router_divert_routes_to_secondary_when_shadow_off() {
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
     };
-    write_commercial_profile(&profile_dir, -100.0, 100.0);
+    write_commercial_profile(&profile_dir, 100.0, -100.0);
     write_minimal_oneclass_model(&profile_dir);
 
     let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
@@ -5975,7 +5975,7 @@ async fn commercial_router_secondary_failure_falls_back_to_primary() {
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
     };
-    write_commercial_profile(&profile_dir, -100.0, 100.0);
+    write_commercial_profile(&profile_dir, 100.0, -100.0);
     write_minimal_oneclass_model(&profile_dir);
 
     let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
@@ -6011,8 +6011,8 @@ async fn commercial_router_blocks_extreme_score_with_route_header() {
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
     };
-    // block_threshold=100 → 任何分数都低于线 → 拦截
-    write_commercial_profile(&profile_dir, 100.0, 200.0);
+    // block=-100 → 任何分数都越线 → R2 直接拦截
+    write_commercial_profile(&profile_dir, -100.0, -200.0);
     write_minimal_oneclass_model(&profile_dir);
 
     let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
@@ -6063,9 +6063,9 @@ async fn commercial_router_unparseable_review_degrades_to_divert() {
     }))
     .await;
 
-    // 分数落合规档(block=-100 < score,divert=-50 <= score),复核由高危
-    // 前缀强制触发;复核解析失败后应把合规档降为存疑
-    write_commercial_review_profile(&profile_dir, -100.0, -50.0, llm_base, &["claude-sonnet"]);
+    // 分数落合规档(block=2 不可达,divert=2 不可达),复核由高危前缀强制
+    // 触发;复核解析失败后按 policy=divert 降级存疑
+    write_commercial_review_profile(&profile_dir, 2.0, 2.0, llm_base, &["claude-sonnet"], "divert");
     write_minimal_oneclass_model(&profile_dir);
 
     let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
@@ -6122,6 +6122,241 @@ async fn commercial_router_unparseable_review_degrades_to_divert() {
     );
 }
 
+
+/// R3 高置信豁免(issue-1 回归):复核判清白且 conf>=0.80 时,即便形态分
+/// 落在存疑档也必须走主上游——标定口径下这是把纯正常误切从 8.56% 压回
+/// 0.34% 的关键规则。
+#[tokio::test]
+async fn commercial_router_cleared_high_confidence_review_exempts_divert() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
+    let profile_name =
+        format!("commercial-exempt-{}-{}", std::process::id(), unique_test_suffix());
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
+
+    let (llm_base, _hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": false, \"category\": null, \"reason\": \"clean\", \"confidence\": 0.9}"
+            }
+        }]
+    }))
+    .await;
+    // 形态分强制落存疑档(divert=-100 必越,block=100 不可达):
+    // 若缺高置信豁免,该请求会被切到次级(回归前行为)
+    write_commercial_review_profile(&profile_dir, 100.0, -100.0, llm_base, &["claude-sonnet"], "self");
+    write_minimal_oneclass_model(&profile_dir);
+
+    let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
+    let (secondary_base, secondary_seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {"enabled": true, "profile": profile_name},
+            "router": {
+                "secondary_upstream": format!("{secondary_base}/v1/chat/completions"),
+                "shadow_mode": false
+            }
+        })
+        .to_string(),
+    );
+
+    let response = post_commercial_request(&proxy_base, &config, &primary_base).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-route")
+            .and_then(|value| value.to_str().ok()),
+        Some("primary"),
+        "cleared & conf=0.9 >= C_GRAY must be exempt even in divert band"
+    );
+    assert!(primary_seen.lock().expect("primary seen").len() >= 1);
+    assert_eq!(
+        secondary_seen.lock().expect("secondary seen").len(),
+        0,
+        "exempt request must never touch the secondary pool"
+    );
+}
+
+/// R3 低置信清白 + 形态异常 → 存疑切上游("中置信→切上游"的另一半)。
+#[tokio::test]
+async fn commercial_router_cleared_low_confidence_diverts_when_anomalous() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
+    let profile_name =
+        format!("commercial-gray-{}-{}", std::process::id(), unique_test_suffix());
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
+
+    let (llm_base, _hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": false, \"category\": null, \"reason\": \"uncertain clean\", \"confidence\": 0.5}"
+            }
+        }]
+    }))
+    .await;
+    // 形态分落存疑档 + cleared conf=0.5 < 0.80 → Divert
+    write_commercial_review_profile(&profile_dir, 100.0, -100.0, llm_base, &["claude-sonnet"], "self");
+    write_minimal_oneclass_model(&profile_dir);
+
+    let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
+    let (secondary_base, secondary_seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {"enabled": true, "profile": profile_name},
+            "router": {
+                "secondary_upstream": format!("{secondary_base}/v1/chat/completions"),
+                "shadow_mode": false
+            }
+        })
+        .to_string(),
+    );
+
+    let response = post_commercial_request(&proxy_base, &config, &primary_base).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-route")
+            .and_then(|value| value.to_str().ok()),
+        Some("secondary"),
+        "cleared conf=0.5 < C_GRAY with anomaly above divert line must divert"
+    );
+    assert!(secondary_seen.lock().expect("secondary seen").len() >= 1);
+    assert_eq!(primary_seen.lock().expect("primary seen").len(), 0);
+}
+
+/// R3 violation 置信分档:conf>=0.85 拦截,低于线只存疑不硬拦。
+#[tokio::test]
+async fn commercial_router_violation_confidence_split_between_block_and_divert() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
+    let profile_name =
+        format!("commercial-vconf-{}-{}", std::process::id(), unique_test_suffix());
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
+
+    // 低置信违规:conf=0.5 < 0.85 → 存疑切上游,不硬拦
+    let (llm_base, _hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": true, \"category\": \"test\", \"reason\": \"mock\", \"confidence\": 0.5}"
+            }
+        }]
+    }))
+    .await;
+    write_commercial_review_profile(&profile_dir, 2.0, 2.0, llm_base, &["claude-sonnet"], "self");
+    write_minimal_oneclass_model(&profile_dir);
+
+    let (primary_base, _primary_seen) = spawn_upstream_echo_server().await;
+    let (secondary_base, secondary_seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {"enabled": true, "profile": profile_name},
+            "router": {
+                "secondary_upstream": format!("{secondary_base}/v1/chat/completions"),
+                "shadow_mode": false
+            }
+        })
+        .to_string(),
+    );
+
+    let response = post_commercial_request(&proxy_base, &config, &primary_base).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "low-confidence violation must divert, not hard-block"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-route")
+            .and_then(|value| value.to_str().ok()),
+        Some("secondary")
+    );
+    assert!(secondary_seen.lock().expect("secondary seen").len() >= 1);
+}
+
+/// R3b 默认策略 self(运营点 none_policy):解析失败 fail-open 走主上游。
+#[tokio::test]
+async fn commercial_router_unparseable_review_default_policy_is_self() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
+    let profile_name =
+        format!("commercial-unp-self-{}-{}", std::process::id(), unique_test_suffix());
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
+
+    let (llm_base, _hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {"content": "GARBAGE-VERDICT not-json-text without braces +++"}
+        }]
+    }))
+    .await;
+    // policy=self(默认):解析失败 → 无语义判定 → 放行主上游
+    write_commercial_review_profile(&profile_dir, 100.0, -100.0, llm_base, &["claude-sonnet"], "self");
+    write_minimal_oneclass_model(&profile_dir);
+
+    let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
+    let (secondary_base, secondary_seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {"enabled": true, "profile": profile_name},
+            "router": {
+                "secondary_upstream": format!("{secondary_base}/v1/chat/completions"),
+                "shadow_mode": false
+            }
+        })
+        .to_string(),
+    );
+
+    let response = post_commercial_request(&proxy_base, &config, &primary_base).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-route")
+            .and_then(|value| value.to_str().ok()),
+        Some("primary"),
+        "default unparseable policy (self) must fail-open to primary"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-llm-result")
+            .and_then(|value| value.to_str().ok()),
+        Some("unparseable")
+    );
+    assert!(primary_seen.lock().expect("primary seen").len() >= 1);
+    assert_eq!(secondary_seen.lock().expect("secondary seen").len(), 0);
+}
+
 /// 复核返回被 markdown 代码块 + 噪声花括号包裹的违规 JSON:
 /// 宽松提取(平衡对象扫描)应救回结论并拦截。
 #[tokio::test]
@@ -6137,12 +6372,12 @@ async fn commercial_router_lenient_parse_blocks_via_glm_review() {
     // 只有宽松提取能拿到结论
     let (llm_base, _hits) = spawn_counting_openai_chat_server(json!({
         "choices": [{
-            "message": {"content": "分析如下{请注意}:\n```json\n{\"violation\": true, \"category\": \"jailbreak\", \"reason\": \"mock\"}\n```\n完毕"}
+            "message": {"content": "分析如下{请注意}:\n```json\n{\"violation\": true, \"category\": \"jailbreak\", \"reason\": \"mock\", \"confidence\": 0.9}\n```\n完毕"}
         }]
     }))
     .await;
 
-    write_commercial_review_profile(&profile_dir, -100.0, -50.0, llm_base, &["claude-sonnet"]);
+    write_commercial_review_profile(&profile_dir, 2.0, 2.0, llm_base, &["claude-sonnet"], "self");
     write_minimal_oneclass_model(&profile_dir);
 
     let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
@@ -6342,6 +6577,7 @@ fn write_commercial_review_profile(
     divert_threshold: f64,
     llm_base: String,
     forced_prefixes: &[&str],
+    review_policy: &str,
 ) {
     std::fs::write(
         profile_dir.join("profile.json"),
@@ -6365,7 +6601,8 @@ fn write_commercial_review_profile(
                 "block_threshold": block_threshold,
                 "divert_threshold": divert_threshold,
                 "review_base_rate": 0.0,
-                "review_forced_model_prefixes": forced_prefixes
+                "review_forced_model_prefixes": forced_prefixes,
+                "review_unparseable_policy": review_policy
             }
         })
         .to_string(),
@@ -6391,7 +6628,7 @@ async fn commercial_router_degrades_to_legacy_chain_without_oneclass_model() {
         }]
     }))
     .await;
-    write_commercial_profile(&profile_dir, -100.0, 100.0);
+    write_commercial_profile(&profile_dir, 100.0, -100.0);
     std::fs::write(
         profile_dir.join("profile.json"),
         json!({

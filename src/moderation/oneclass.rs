@@ -1,14 +1,21 @@
 //! one-class 滑窗异常打分(商业化路由的排序/分档信号)。
 //!
-//! 思路沿用可行性研究(run_oneclass2.py 方法A):
-//! - 请求文本切 8K 字符窗,逐窗 char 2-4 gram 哈希特征 + TF 归一化;
-//! - 每窗与"正常流量质心"(训练产物,稀疏 khash->weight)算余弦;
-//! - 取最小余弦窗 = 最异常窗,作为请求级原始分(**越高越合规**);
-//! - 再按模型名前缀分组的基线分位(p05/p50)归一化,修正 opus/grok 等
-//!   模型线的系统性偏置(基线表在 profile 配置,缺省组用 "*")。
+//! 分数空间与标定实验严格一致(tv-research/scripts/decision_sim.py):
+//! - 请求文本按 max_scan_chars(默认 100K,对齐 MAX_CHARS)截断后切 8K
+//!   字符非重叠滑窗;
+//! - 每窗 char 2-4 gram 特征化,TF 归一化后与"正常流量质心"(训练产物,
+//!   已 L2 归一)点积:sim = Σ(c_g/T)·cen_g(T=窗内命中词表的总计数);
+//! - anomaly = -min_windows(sim) = 最异常窗取负(**越高越异常**),
+//!   tf=0 的退化窗排除(空/纯未登录词),全退化按最不异常 -1.0;
+//! - 可选按模型名前缀分组的基线分位归一化(p50→0,p95→1,越高越异常),
+//!   修正 opus/grok 等模型线的系统性偏置;未配置基线时决策分=原始
+//!   anomaly,OPERATING_POINT.json 的阈值可原样填入。
 //!
 //! 模型文件(JSON)放在 profile 目录,支持 mtime+size 签名的热重载
-//! (与 basic.rs 词库 / hashlinear.rs runtime 同一套缓存模式)。
+//! (与 basic.rs 词库 / hashlinear.rs runtime 同一套缓存模式):
+//! - runtime_version=2:词表模式(标定导出,gram 字符串→词表下标,
+//!   与 sklearn CountVectorizer 的 vocabulary_ 语义一致,未登录词丢弃);
+//! - runtime_version=1:murmur 哈希桶模式(玩具/兼容,gram→murmur 桶)。
 //! 模型文件不存在时优雅跳过:调用方降级为现状决策链,不影响可用性。
 
 use std::collections::HashMap;
@@ -38,7 +45,9 @@ struct ModelFileSignature {
 }
 
 /// 模型文件(oneclass_model.json)的结构。
-/// centroid 为稀疏质心:khash(bucket 下标) -> 权重,加载时做 L2 归一。
+/// centroid 为稀疏质心:特征下标 -> 权重,加载时做 L2 归一。
+/// 词表模式(v2)下特征下标 = vocab 数组位置(与导出侧一致);
+/// 哈希模式(v1)下特征下标 = murmur 桶。
 #[derive(Debug, Clone, Deserialize)]
 struct ModelFile {
     runtime_version: u32,
@@ -52,6 +61,9 @@ struct ModelFile {
     lowercase: bool,
     #[serde(default)]
     alternate_sign: bool,
+    /// 词表模式(v2):gram 字符串数组,下标即特征下标。
+    #[serde(default)]
+    vocab: Option<Vec<String>>,
     centroid: HashMap<String, f64>,
 }
 
@@ -71,30 +83,38 @@ fn default_true() -> bool {
     true
 }
 
+/// 特征空间:gram → 特征下标的映射方式。
+#[derive(Debug, Clone)]
+enum FeatureSpace {
+    /// 词表模式:精确匹配,未登录词丢弃(对齐 sklearn vocabulary_)。
+    Vocab { index: HashMap<String, usize> },
+    /// murmur 哈希模式(玩具/兼容):gram → murmur 桶。
+    Murmur { n_features: usize, alternate_sign: bool },
+}
+
 /// 加载后的模型:质心已 L2 归一(单位向量),特征参数经校验。
 #[derive(Debug, Clone)]
 pub struct OneClassModel {
     window_chars: usize,
     ngram_range: (usize, usize),
-    n_features: usize,
     lowercase: bool,
-    alternate_sign: bool,
+    features: FeatureSpace,
     centroid: HashMap<usize, f64>,
 }
 
 /// 一次请求的打分结果。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OneClassScore {
-    /// 最异常窗的原始余弦分,越高越接近正常流量。
-    pub raw_score: f64,
-    /// 按模型分组基线归一化后的分(p05→0,p50→1,越高越合规);
-    /// 未配置基线时等于 raw_score。
-    pub normalized_score: f64,
+    /// 原始异常分 = -最异常窗的 TF·质心相似度(越高越异常;全退化窗=-1.0)。
+    pub anomaly: f64,
+    /// 按模型分组基线归一化后的异常分(p50→0,p95→1,越高越异常);
+    /// 未配置基线时等于 anomaly。
+    pub normalized_anomaly: f64,
     /// 命中的基线分组前缀(未命中任何分组时为 "*";未配置基线表时为 "raw")。
     pub baseline_group: String,
     /// 实际参与打分的窗数(空文本为 0)。
     pub window_count: usize,
-    /// 最异常窗的字符区间 [start, end)(全文坐标;空文本为 None)。
+    /// 最异常窗的字符区间 [start, end)(全文坐标;空文本/全退化窗为 None)。
     /// 供截断逻辑把"中段"对准最异常区段,避免中段藏毒被截掉。
     pub anomaly_window: Option<(usize, usize)>,
 }
@@ -125,56 +145,61 @@ pub fn score_request(
     let max_scan = profile.config.oneclass.max_scan_chars;
     let window_count = count_windows(text, model.window_chars, max_scan);
     if window_count == 0 {
-        // 空文本无信号:按"最合规"处理,决策链自然放行主上游
+        // 空文本无信号:对齐标定语义(全退化窗),按最不异常处理放行主上游
         return Ok(Some(OneClassScore {
-            raw_score: 1.0,
-            normalized_score: 1.0,
+            anomaly: -1.0,
+            normalized_anomaly: -1.0,
             baseline_group: "empty".to_string(),
             window_count: 0,
             anomaly_window: None,
         }));
     }
 
-    let (raw_score, anomaly_window) = score_windows(text, &model, max_scan);
-    let (normalized, group) =
-        normalize_with_baseline(raw_score, model_name, &profile.config.oneclass.baselines);
+    let (anomaly, anomaly_window) = score_windows(text, &model, max_scan);
+    let (normalized, group) = normalize_with_baseline(
+        anomaly,
+        model_name,
+        &profile.config.oneclass.baselines,
+    );
     Ok(Some(OneClassScore {
-        raw_score,
-        normalized_score: normalized,
+        anomaly,
+        normalized_anomaly: normalized,
         baseline_group: group,
         window_count,
         anomaly_window,
     }))
 }
 
-/// 计算请求级原始分:所有窗中最小的余弦(最异常窗),并返回该窗的
-/// 字符区间(供截断逻辑定位中段)。
+/// 计算请求级原始异常分:-min(窗相似度),并返回最异常窗的字符区间
+/// (供截断逻辑定位中段)。退化窗(tf=0,如空窗/全部是未登录词)不参与
+/// 取最小;全部退化时返回 (-1.0, None)(最不异常,对齐 decision_sim)。
 fn score_windows(
     text: &str,
     model: &OneClassModel,
     max_scan_chars: usize,
 ) -> (f64, Option<(usize, usize)>) {
     let chars: Vec<char> = text.chars().take(max_scan_chars).collect();
-    let mut min_cosine = f64::MAX;
+    let mut min_sim = f64::MAX;
     let mut best: Option<(usize, usize)> = None;
     let mut offset = 0usize;
     for window in iter_windows(&chars, model.window_chars) {
-        let counts = window_counts(window, &model);
-        let cosine = cosine_with_centroid(&counts, model);
-        if cosine < min_cosine {
-            min_cosine = cosine;
-            best = Some((offset, offset + window.len()));
+        let counts = window_counts(window, model);
+        if let Some(sim) = tf_centroid_similarity(&counts, model) {
+            if sim < min_sim {
+                min_sim = sim;
+                best = Some((offset, offset + window.len()));
+            }
         }
         offset += window.len();
     }
-    if min_cosine == f64::MAX {
-        (1.0, best)
+    if min_sim == f64::MAX {
+        (-1.0, None)
     } else {
-        (min_cosine, best)
+        (-min_sim, best)
     }
 }
 
-/// 最异常窗(余弦最小的滑窗)的字符区间 [start, end)(相对全文,UTF-8 安全:
+/// 最异常窗(相似度最小的滑窗)的字符区间 [start, end)(相对全文,UTF-8 安全:
 /// 下标按 char 计)。模型缺失/空文本(无窗)返回 None。
 ///
 /// 用途:truncate_text 的中段定位——长文本截断时优先保留被判为最异常的
@@ -221,10 +246,10 @@ fn count_windows(text: &str, window_chars: usize, max_scan_chars: usize) -> usiz
     }
 }
 
-/// 单窗特征:char n-gram 哈希计数(TF)。TF 归一化在余弦里天然抵消
-/// (余弦对向量缩放不敏感),此处直接产出计数向量。
-fn window_counts(window: &[char], model: &OneClassModel) -> HashMap<usize, f64> {
-    let mut counts: HashMap<usize, f64> = HashMap::new();
+/// 单窗特征:char n-gram 计数(特征下标按模型特征空间分配)。
+/// 用 BTreeMap:求和顺序确定,保证同输入同分数(与对数验证的可复现性)。
+fn window_counts(window: &[char], model: &OneClassModel) -> std::collections::BTreeMap<usize, f64> {
+    let mut counts: std::collections::BTreeMap<usize, f64> = std::collections::BTreeMap::new();
     let (min_n, max_n) = model.ngram_range;
     let len = window.len();
     if len == 0 {
@@ -236,54 +261,102 @@ fn window_counts(window: &[char], model: &OneClassModel) -> HashMap<usize, f64> 
     } else {
         window.to_vec()
     };
+    // 对齐 sklearn CountVectorizer._char_ngrams 的空白归一:
+    // 先小写,再把 ≥2 连续空白折叠成单个空格(单个空白保留原字符)。
+    let normalized = collapse_whitespace_runs(&lowered);
 
-    let mut push_gram = |gram: &str| {
-        let hash = murmurhash3_x86_32(gram.as_bytes(), 0);
-        let idx = hash.unsigned_abs() as usize % model.n_features;
-        let sign = if model.alternate_sign && hash < 0 { -1.0 } else { 1.0 };
-        *counts.entry(idx).or_insert(0.0) += sign;
+    let mut push_gram = |gram: &str,
+                         model: &OneClassModel,
+                         counts: &mut std::collections::BTreeMap<usize, f64>| {
+        match &model.features {
+            FeatureSpace::Vocab { index } => {
+                // 未登录词丢弃(对齐 sklearn vocabulary_ 语义)
+                if let Some(idx) = index.get(gram) {
+                    *counts.entry(*idx).or_insert(0.0) += 1.0;
+                }
+            }
+            FeatureSpace::Murmur { n_features, alternate_sign } => {
+                let hash = murmurhash3_x86_32(gram.as_bytes(), 0);
+                let bucket = hash.unsigned_abs() as usize % n_features;
+                let sign = if *alternate_sign && hash < 0 { -1.0 } else { 1.0 };
+                *counts.entry(bucket).or_insert(0.0) += sign;
+            }
+        }
     };
 
-    for n in min_n..=max_n.min(lowered.len()) {
+    for n in min_n..=max_n.min(normalized.len()) {
         if n == 0 {
             continue;
         }
         if n == 1 {
-            for ch in &lowered {
-                push_gram(&ch.to_string());
+            for ch in &normalized {
+                push_gram(&ch.to_string(), model, &mut counts);
             }
             continue;
         }
-        for start in 0..=lowered.len().saturating_sub(n) {
-            let gram: String = lowered[start..start + n].iter().collect();
-            push_gram(&gram);
+        for start in 0..=normalized.len().saturating_sub(n) {
+            let gram: String = normalized[start..start + n].iter().collect();
+            push_gram(&gram, model, &mut counts);
         }
     }
     counts
 }
 
-/// 窗 TF 向量与单位质心的余弦。
-fn cosine_with_centroid(counts: &HashMap<usize, f64>, model: &OneClassModel) -> f64 {
-    let mut dot = 0.0_f64;
-    let mut norm_sq = 0.0_f64;
-    for (idx, value) in counts {
-        norm_sq += value * value;
-        if let Some(weight) = model.centroid.get(idx) {
-            dot += value * weight;
+/// 复刻 sklearn `re.sub(r"\s\s+", " ", text)`:≥2 的连续空白串折叠成
+/// 单个空格;单个空白字符原样保留。(Python \s 与 Rust is_whitespace 在
+/// 极少数控制符上可能有差异,请求文本中不出现。)
+fn collapse_whitespace_runs(chars: &[char]) -> Vec<char> {
+    let mut out = Vec::with_capacity(chars.len());
+    let mut idx = 0;
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if ch.is_whitespace() {
+            let mut run_end = idx + 1;
+            while run_end < chars.len() && chars[run_end].is_whitespace() {
+                run_end += 1;
+            }
+            if run_end - idx >= 2 {
+                out.push(' ');
+            } else {
+                out.push(ch);
+            }
+            idx = run_end;
+        } else {
+            out.push(ch);
+            idx += 1;
         }
     }
-    let norm = norm_sq.sqrt();
-    if norm <= 0.0 {
-        // 无特征(理论上空窗才会):按"无信号=正常"处理
-        return 1.0;
+    out
+}
+
+/// 窗 TF 向量与单位质心的相似度(对齐 decision_sim.score_all):
+/// sim = Σ(c_i·cen_i) / Σc_i,分子分母都只统计"命中模型特征空间"的计数
+/// (词表模式的未登录词、哈希模式落在质心空桶上的 gram 同样不计入分母,
+/// 对齐 sklearn 只统计 vocabulary_ 列的语义)。
+/// tf=0 的退化窗返回 None(空窗/全部未登录词)。
+fn tf_centroid_similarity(
+    counts: &std::collections::BTreeMap<usize, f64>,
+    model: &OneClassModel,
+) -> Option<f64> {
+    let mut dot = 0.0_f64;
+    let mut tf = 0.0_f64;
+    for (idx, value) in counts {
+        if let Some(weight) = model.centroid.get(idx) {
+            dot += value * weight;
+            tf += value;
+        }
     }
-    dot / norm
+    if tf <= 0.0 {
+        return None;
+    }
+    Some(dot / tf)
 }
 
 /// 按模型名前缀匹配基线分组(大小写不敏感,顺序匹配,先配置先命中);
 /// 未命中具体分组时用全局组 "*";连全局组都没有则不归一(直接用原始分)。
+/// normalized = (anomaly - p50) / (p95 - p50):p95==p50 退化时不拉伸。
 fn normalize_with_baseline(
-    raw_score: f64,
+    anomaly: f64,
     model_name: &str,
     baselines: &[crate::profile::OneClassBaseline],
 ) -> (f64, String) {
@@ -301,16 +374,16 @@ fn normalize_with_baseline(
         });
 
     let Some(baseline) = matched else {
-        return (raw_score, "raw".to_string());
+        return (anomaly, "raw".to_string());
     };
 
-    let span = baseline.p50 - baseline.p05;
+    let span = baseline.p95 - baseline.p50;
     if span.abs() < 1e-12 {
-        // 退化基线(p50==p05):不做拉伸,避免除零放大噪声
-        return (raw_score, baseline.prefix.clone());
+        // 退化基线(p95==p50):不做拉伸,避免除零放大噪声
+        return (anomaly, baseline.prefix.clone());
     }
-    // p05→0(组内最异常 5% 分位),p50→1(组内中位),越高越合规
-    let normalized = (raw_score - baseline.p05) / span;
+    // p50→0(组内中位),p95→1(组内 95 分位异常尾部),越高越异常
+    let normalized = (anomaly - baseline.p50) / span;
     (normalized, baseline.prefix.clone())
 }
 
@@ -380,19 +453,10 @@ impl OneClassModel {
         let file: ModelFile = serde_json::from_str(&raw)
             .with_context(|| format!("failed to parse {}", path.display()))?;
 
-        if file.runtime_version != 1 {
-            return Err(anyhow!(
-                "unsupported oneclass runtime_version: {}",
-                file.runtime_version
-            ));
-        }
         let ngram_range = match file.ngram_range.as_slice() {
             [min_n, max_n] if *min_n > 0 && *min_n <= *max_n => (*min_n, *max_n),
             other => return Err(anyhow!("invalid oneclass ngram_range: {:?}", other)),
         };
-        if file.n_features == 0 {
-            return Err(anyhow!("oneclass n_features must be > 0"));
-        }
         if file.centroid.is_empty() {
             return Err(anyhow!("oneclass centroid must not be empty"));
         }
@@ -400,16 +464,52 @@ impl OneClassModel {
             return Err(anyhow!("oneclass window_chars must be > 0"));
         }
 
+        let features = match file.runtime_version {
+            1 => FeatureSpace::Murmur {
+                n_features: file.n_features,
+                alternate_sign: file.alternate_sign,
+            },
+            2 => {
+                let vocab = file
+                    .vocab
+                    .ok_or_else(|| anyhow!("oneclass v2 model requires vocab"))?;
+                if vocab.is_empty() {
+                    return Err(anyhow!("oneclass v2 vocab must not be empty"));
+                }
+                FeatureSpace::Vocab {
+                    index: vocab
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, gram)| (gram, idx))
+                        .collect(),
+                }
+            }
+            other => {
+                return Err(anyhow!(
+                    "unsupported oneclass runtime_version: {other} (expected 1 or 2)"
+                ))
+            }
+        };
+        if let FeatureSpace::Murmur { n_features, .. } = &features {
+            if *n_features == 0 {
+                return Err(anyhow!("oneclass n_features must be > 0"));
+            }
+        }
+
+        let vocab_len = match &features {
+            FeatureSpace::Vocab { index } => Some(index.len()),
+            FeatureSpace::Murmur { n_features, .. } => Some(*n_features),
+        };
         let mut centroid = HashMap::with_capacity(file.centroid.len());
         let mut norm_sq = 0.0_f64;
         for (key, weight) in &file.centroid {
             let idx: usize = key
                 .parse()
                 .with_context(|| format!("invalid oneclass centroid key: {key}"))?;
-            if idx >= file.n_features {
+            if idx >= vocab_len.expect("checked above") {
                 return Err(anyhow!(
-                    "oneclass centroid key {idx} out of range (n_features={})",
-                    file.n_features
+                    "oneclass centroid key {idx} out of range (features={})",
+                    vocab_len.expect("checked above")
                 ));
             }
             if !weight.is_finite() {
@@ -429,9 +529,8 @@ impl OneClassModel {
         Ok(Self {
             window_chars: file.window_chars,
             ngram_range,
-            n_features: file.n_features,
             lowercase: file.lowercase,
-            alternate_sign: file.alternate_sign,
+            features,
             centroid,
         })
     }
@@ -441,30 +540,13 @@ impl OneClassModel {
 mod tests {
     use super::*;
     use std::io::Write;
-    std::thread_local! {
-        static TEST_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    }
 
     fn unique_profile() -> ModerationProfile {
         use std::sync::atomic::{AtomicU32, Ordering};
-        use std::time::{SystemTime, UNIX_EPOCH};
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        // 命名必须跨运行唯一:早期版本用 pid+自增 id,Windows pid 回卷后
-        // 会命中上次运行遗留的目录,把"无模型"用例变成"读到陈旧模型"
-        // (本地实测 366 个遗留目录时连续翻车)。此处加进程启动时间戳,
-        // 并对同名遗留目录做防御性清理。
-        static RUN_STAMP: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
-        let stamp = *RUN_STAMP.get_or_init(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0)
-        });
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let base =
-            std::env::temp_dir().join(format!("oneclass-test-{stamp}-{id}"));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).expect("create profile dir");
+        let base = std::env::temp_dir().join(format!("oneclass-test-{}-{}", std::process::id(), id));
+        std::fs::create_dir_all(&base).expect("create profile dir");
         ModerationProfile {
             profile_name: format!("oneclass-{id}"),
             base_dir: base,
@@ -486,17 +568,13 @@ mod tests {
             "n_features": 1024,
             "lowercase": true,
             "alternate_sign": false,
-            "centroid": {
-                // "ababab" 的 2-gram "ab"/"ba" 会落到这两个桶,权重相等 → 质心即该方向
-                "0": 1.0,
-                "1": 1.0
-            }
+            "centroid": {"0": 1.0, "1": 1.0}
         })
     }
 
-    fn set_centroid_for_text(json: &mut serde_json::Value, text: &str) {
-        // 按模型参数计算文本 gram 计数向量,把质心对准该文本方向
-        // (训练产物的质心 = 正常窗 TF 均值,单文本时即其计数向量方向)
+    /// 按模型参数计算文本 gram 计数质心(单文本时即训练质心方向),
+    /// murmur 桶模式。
+    fn murmur_centroid_for_text(json: &mut serde_json::Value, text: &str) {
         let n_features = json["n_features"].as_u64().unwrap() as usize;
         let lowercase = json["lowercase"].as_bool().unwrap_or(true);
         let chars: Vec<char> = if lowercase {
@@ -520,6 +598,35 @@ mod tests {
             centroid.insert(idx.to_string(), serde_json::json!(count));
         }
         json["centroid"] = serde_json::Value::Object(centroid);
+    }
+
+    /// 词表模式模型:词表取自 text 的全部 2-4 gram,质心=计数向量。
+    fn vocab_model_json(text: &str, window_chars: usize) -> serde_json::Value {
+        let chars: Vec<char> = text.chars().flat_map(|ch| ch.to_lowercase()).collect();
+        let mut vocab: Vec<String> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        let mut counts: std::collections::BTreeMap<usize, f64> = std::collections::BTreeMap::new();
+        for n in 2..=4usize {
+            if chars.len() < n {
+                continue;
+            }
+            for start in 0..=chars.len() - n {
+                let gram: String = chars[start..start + n].iter().collect();
+                let idx = *index.entry(gram.clone()).or_insert_with(|| {
+                    vocab.push(gram);
+                    vocab.len() - 1
+                });
+                *counts.entry(idx).or_insert(0.0) += 1.0;
+            }
+        }
+        serde_json::json!({
+            "runtime_version": 2,
+            "window_chars": window_chars,
+            "ngram_range": [2, 4],
+            "lowercase": true,
+            "vocab": vocab,
+            "centroid": counts.into_iter().map(|(k, v)| (k.to_string(), v)).collect::<HashMap<String, f64>>(),
+        })
     }
 
     #[test]
@@ -546,7 +653,7 @@ mod tests {
         assert_eq!(count_windows(&text, 30, 400_000), 1);
         assert_eq!(count_windows(&text, 31, 400_000), 1);
         assert_eq!(count_windows("", 8, 400_000), 0);
-        // 超出 max_scan_chars 的部分不参与
+        // 超出 max_scan_chars 的部分不参与(对齐标定 MAX_CHARS 语义)
         assert_eq!(count_windows(&text, 8, 10), 2);
         let chars: Vec<char> = text.chars().collect();
         let windows: Vec<&[char]> = iter_windows(&chars, 8).collect();
@@ -555,42 +662,97 @@ mod tests {
         assert_eq!(windows[3].len(), 6);
     }
 
+    /// 手工可验的玩具样例:文本只由 2 个 gram 组成,TF·质心相似度可精确计算。
+    /// text = "abab" → 2-gram: ab×1? 实为 ab,ba,ab → ab×2, ba×1;
+    /// 3-gram: aba×1, bab×1;4-gram: abab×1。质心=同文本计数方向(归一后)。
+    /// sim = Σc²/(T·||c||),c 为计数向量。
     #[test]
-    fn cosine_identical_text_is_one_and_orthogonal_is_lower() {
+    fn tf_centroid_similarity_formula_matches_hand_computation() {
+        let profile = unique_profile();
+        let text = "abab";
+        // 只含 "ab"/"ba" 两个 2-gram 的词表,质心取计数方向:
+        // "abab" 的 2-gram = ab×2, ba×1 → c=(2,1)
+        write_model(
+            &profile,
+            &serde_json::json!({
+                "runtime_version": 2,
+                "window_chars": 512,
+                "ngram_range": [2, 2],
+                "lowercase": true,
+                "vocab": ["ab", "ba"],
+                "centroid": {"0": 2.0, "1": 1.0}
+            }),
+        );
+
+        let score = score_request(text, "m", &profile)
+            .expect("score")
+            .expect("model");
+        // c = (2,1),T = 3,cen = (2,1)/sqrt(5);
+        // sim = (2·2/√5 + 1·1/√5)/3 = 5/(3√5);anomaly = -sim
+        let expected_sim = 5.0 / (3.0 * 5.0_f64.sqrt());
+        assert!(
+            (score.anomaly - (-expected_sim)).abs() < 1e-12,
+            "anomaly {} should be -{}",
+            score.anomaly,
+            expected_sim
+        );
+    }
+
+    #[test]
+    fn anomaly_orders_alien_above_normal_text() {
         let profile = unique_profile();
         let mut json = toy_model_json();
-        // 文本短于窗长 → 单窗,且该窗与质心同为整文本方向
         json["window_chars"] = serde_json::json!(512);
         let normal = "normal chat text about weather and code";
-        set_centroid_for_text(&mut json, normal);
+        murmur_centroid_for_text(&mut json, normal);
         write_model(&profile, &json);
 
         let same = score_request(normal, "claude-3", &profile)
             .expect("score")
             .expect("model present");
-        // 与质心同向(同文本)的窗余弦应为 1(允许浮点误差)
-        assert!((same.raw_score - 1.0).abs() < 1e-9, "got {}", same.raw_score);
-
-        // 换成与训练文本完全不同字符组合的文本,余弦应显著更低
         let alien = "zzzzqqqqxxxxwwwwvvvv";
         let alien_score = score_request(alien, "claude-3", &profile)
             .expect("score")
             .expect("model present");
         assert!(
-            alien_score.raw_score < same.raw_score,
-            "alien {} should be below normal {}",
-            alien_score.raw_score,
-            same.raw_score
+            alien_score.anomaly > same.anomaly,
+            "alien anomaly {} should exceed normal {}",
+            alien_score.anomaly,
+            same.anomaly
         );
+        // 与质心同向文本的相似度为正 → anomaly 为负(标定空间正常流量特征)
+        assert!(same.anomaly < 0.0, "normal-text anomaly should be negative");
+    }
+
+    #[test]
+    fn vocab_model_drops_out_of_vocab_grams() {
+        let profile = unique_profile();
+        // 词表只含 "normal chat" 相关 gram
+        let json = vocab_model_json("normal chat text", 512);
+        write_model(&profile, &json);
+
+        // 全是未登录词的窗 → tf=0 退化 → 全退化按 -1.0(最不异常,glm 层接管)
+        let alien = score_request("zz qq xx ww vv", "m", &profile)
+            .expect("score")
+            .expect("model");
+        assert_eq!(alien.anomaly, -1.0);
+        assert_eq!(alien.anomaly_window, None);
+
+        // 命中词表的文本正常打分
+        let normal = score_request("normal chat text", "m", &profile)
+            .expect("score")
+            .expect("model");
+        assert!(normal.anomaly < 0.0);
+        assert!(normal.anomaly_window.is_some());
     }
 
     #[test]
     fn most_anomalous_window_drives_request_score() {
-        // 长正常文本中段塞入异质窗:请求级分数应被最异常窗拉低
+        // 长正常文本中段塞入异质窗:请求级 anomaly 应被最异常窗抬高
         let profile = unique_profile();
         let mut json = toy_model_json();
         let normal_unit = "normal chat about weather and code ".repeat(20);
-        set_centroid_for_text(&mut json, &normal_unit);
+        murmur_centroid_for_text(&mut json, &normal_unit);
         json["window_chars"] = serde_json::json!(32);
         write_model(&profile, &json);
 
@@ -607,10 +769,10 @@ mod tests {
             .expect("score")
             .expect("model");
         assert!(
-            poisoned_score.raw_score < clean.raw_score,
-            "mid-poisoned {} should be below clean {}",
-            poisoned_score.raw_score,
-            clean.raw_score
+            poisoned_score.anomaly > clean.anomaly,
+            "mid-poisoned anomaly {} should exceed clean {}",
+            poisoned_score.anomaly,
+            clean.anomaly
         );
         assert!(poisoned_score.window_count > 1);
     }
@@ -620,137 +782,120 @@ mod tests {
         let mut baselines = vec![
             crate::profile::OneClassBaseline {
                 prefix: "claude-opus".to_string(),
-                p05: 0.20,
-                p50: 0.40,
+                p50: 0.0,
+                p95: 0.1,
             },
             crate::profile::OneClassBaseline {
                 prefix: "*".to_string(),
-                p05: 0.30,
-                p50: 0.50,
+                p50: -0.02,
+                p95: 0.08,
             },
         ];
 
-        // 命中 opus 组:p05→0, p50→1
-        let (norm, group) = normalize_with_baseline(0.40, "claude-opus-4-5", &baselines);
-        assert!((norm - 1.0).abs() < 1e-9);
+        // 命中 opus 组:p50→0, p95→1
+        let (norm, group) = normalize_with_baseline(0.0, "claude-opus-4-5", &baselines);
+        assert!((norm - 0.0).abs() < 1e-9);
         assert_eq!(group, "claude-opus");
-        let (norm, _) = normalize_with_baseline(0.20, "CLAUDE-OPUS-1", &baselines);
-        assert!((norm - 0.0).abs() < 1e-9, "prefix match should be case-insensitive");
+        let (norm, _) = normalize_with_baseline(0.1, "claude-opus-4-5", &baselines);
+        assert!((norm - 1.0).abs() < 1e-9);
+        // 前缀匹配大小写不敏感
+        let (norm, _) = normalize_with_baseline(0.0, "CLAUDE-OPUS-1", &baselines);
+        assert!((norm - 0.0).abs() < 1e-9);
+        // 比中位更不异常 → 负值(不切流)
+        let (norm, _) = normalize_with_baseline(-0.05, "claude-opus-1", &baselines);
+        assert!(norm < 0.0);
 
         // 未命中具体组 → 全局 "*"
-        let (norm, group) = normalize_with_baseline(0.50, "grok-4", &baselines);
-        assert!((norm - 1.0).abs() < 1e-9);
+        let (norm, group) = normalize_with_baseline(-0.02, "grok-4", &baselines);
+        assert!((norm - 0.0).abs() < 1e-9);
         assert_eq!(group, "*");
 
         // 无任何基线 → 原始分
         baselines.clear();
-        let (norm, group) = normalize_with_baseline(0.42, "claude-opus", &baselines);
-        assert!((norm - 0.42).abs() < 1e-12);
+        let (norm, group) = normalize_with_baseline(-0.42, "claude-opus", &baselines);
+        assert!((norm - -0.42).abs() < 1e-12);
         assert_eq!(group, "raw");
 
         // 退化基线:不拉伸
         let degenerate = vec![crate::profile::OneClassBaseline {
             prefix: "*".to_string(),
-            p05: 0.4,
             p50: 0.4,
+            p95: 0.4,
         }];
-        let (norm, _) = normalize_with_baseline(0.9, "grok", &degenerate);
-        assert!((norm - 0.9).abs() < 1e-12);
+        let (norm, _) = normalize_with_baseline(-0.9, "grok", &degenerate);
+        assert!((norm - -0.9).abs() < 1e-12);
     }
 
     #[test]
     fn model_hot_reload_on_file_change() {
         let profile = unique_profile();
+        let text = "aaaa bbbb cccc dddd";
+        // 首版质心:正对该文本(计数方向)→ sim>0,anomaly<0,有最异常窗
         let mut json = toy_model_json();
         json["window_chars"] = serde_json::json!(512);
+        murmur_centroid_for_text(&mut json, text);
         write_model(&profile, &json);
-        let text = "aaaa bbbb cccc dddd";
 
         let first = score_request(text, "m", &profile).expect("score").expect("model");
-        // 原始分与缓存一致(重复调用命中缓存,结果不变)
+        assert!(first.anomaly_window.is_some());
+        assert!(first.anomaly < 0.0);
+        // 缓存命中:重复调用逐位一致
         let again = score_request(text, "m", &profile).expect("score").expect("model");
         assert_eq!(first, again);
 
-        // 改写模型:质心换到正对该文本的方向(计数质心)→ 分数变为 1,证明热重载生效
+        // 搜索与目标文本零桶重叠的异质文本:所有窗都退化(tf=0)
+        let buckets_of = |s: &str| -> std::collections::HashSet<usize> {
+            (2..=4)
+                .flat_map(|n| {
+                    let chars: Vec<char> = s.chars().collect();
+                    (0..=chars.len().saturating_sub(n))
+                        .map(move |i| chars[i..i + n].iter().collect::<String>())
+                })
+                .map(|gram: String| {
+                    let hash = murmurhash3_x86_32(gram.as_bytes(), 0);
+                    hash.unsigned_abs() as usize % 1024
+                })
+                .collect()
+        };
+        let text_buckets = buckets_of(text);
+        let alien = ["zqxw", "vjyk", "gpzb", "qmxn", "wkrj", "xlfp", "ytsb", "ndvh"]
+            .into_iter()
+            .map(str::to_string)
+            .chain((0..64).map(|i| format!("alien-unique-{i}")))
+            .find(|candidate| text_buckets.is_disjoint(&buckets_of(candidate)))
+            .expect("test setup: found no bucket-disjoint alien candidate");
+
+        // 重载:质心换到异质方向 → 该文本全窗退化 → anomaly 固定 -1.0、无窗
         let mut json2 = toy_model_json();
         json2["window_chars"] = serde_json::json!(512);
-        set_centroid_for_text(&mut json2, text);
-        // 签名含 mtime 秒与 len;主动 sleep 跨秒确保签名变化
+        murmur_centroid_for_text(&mut json2, &alien);
         std::thread::sleep(std::time::Duration::from_millis(1100));
         write_model(&profile, &json2);
         let reloaded = score_request(text, "m", &profile).expect("score").expect("model");
-        assert!(
-            (reloaded.raw_score - 1.0).abs() < 1e-9,
-            "reloaded model should score identical text as 1.0, got {}",
-            reloaded.raw_score
-        );
-        assert!(
-            first.raw_score < reloaded.raw_score,
-            "score should change after hot reload: {} -> {}",
-            first.raw_score,
-            reloaded.raw_score
-        );
+        assert_eq!(reloaded.anomaly, -1.0, "all-degenerate windows must score -1.0");
+        assert_eq!(reloaded.anomaly_window, None);
+        assert_ne!(first.anomaly, reloaded.anomaly, "hot reload must change the score");
     }
 
     #[test]
-    fn empty_text_scores_as_fully_normal() {
+    fn empty_text_scores_as_least_anomalous() {
         let profile = unique_profile();
         write_model(&profile, &toy_model_json());
         let score = score_request("", "m", &profile)
             .expect("score")
             .expect("model");
-        assert_eq!(score.raw_score, 1.0);
+        // 对齐 decision_sim:全退化窗 → anomaly = -1.0(最不异常)
+        assert_eq!(score.anomaly, -1.0);
         assert_eq!(score.window_count, 0);
-        assert_eq!(score.anomaly_window, None);
     }
 
     #[test]
-    fn most_anomalous_window_lands_on_alien_segment() {
-        // 截断修复的定位来源:最异常窗必须落在远离中点的异质段上,
-        // 且独立查询接口与 score_request 的结果一致。
+    fn v2_model_without_vocab_is_rejected() {
         let profile = unique_profile();
         let mut json = toy_model_json();
-        let normal_unit = "normal chat about weather and code ".repeat(7); // 245 chars
-        set_centroid_for_text(&mut json, &normal_unit);
-        json["window_chars"] = serde_json::json!(40);
+        json["runtime_version"] = serde_json::json!(2);
+        json["vocab"] = serde_json::Value::Null;
         write_model(&profile, &json);
-
-        // 全文除异质段外都用正常模式连续填充:单字符填充(如 'n'/'k' 重复)
-        // 自身的 gram 分布与质心正交,会形成一个"假最异常窗"干扰断言
-        let normal_filler: String = normal_unit.chars().cycle().take(258).collect();
-        let mut text = normal_filler;
-        let alien: String = "zqxjwv-".repeat(14).chars().take(92).collect();
-        text.push_str(&alien); // 258..350:异质段(中点窗 180..220 之外)
-        let normal_tail: String = normal_unit.chars().cycle().take(50).collect();
-        text.push_str(&normal_tail); // 350..400
-        assert_eq!(text.chars().count(), 400);
-
-        let score = score_request(&text, "m", &profile)
-            .expect("score")
-            .expect("model");
-        let (start, end) = score
-            .anomaly_window
-            .expect("anomaly window for multi-window text");
-        assert!(
-            end > 258 && start < 350,
-            "window {start}..{end} must intersect the alien segment 258..350"
-        );
-        let center = (start + end) / 2;
-        assert!(
-            (258..=350).contains(&center),
-            "window center {center} should sit inside the alien segment"
-        );
-        // 独立接口(供现状 smart 链定位)与打分结果一致
-        assert_eq!(
-            most_anomalous_window_center(&text, &profile),
-            Some(center)
-        );
-
-        // 短文本(单窗):区间就是整段文本
-        let short = "normal chat about weather";
-        let short_score = score_request(short, "m", &profile)
-            .expect("score")
-            .expect("model");
-        assert_eq!(short_score.anomaly_window, Some((0, short.chars().count())));
+        assert!(score_request("x", "m", &profile).expect("score").is_none());
     }
 }

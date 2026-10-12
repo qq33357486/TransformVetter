@@ -266,31 +266,42 @@ impl Default for HashLinearTrainingConfig {
     }
 }
 
-/// one-class 滑窗打分的按模型名前缀分组的基线分位。
-/// normalized = (raw - p05) / (p50 - p05):组内最异常 5% 分位→0,中位→1,越高越合规。
-/// prefix 为 "*" 时表示全局缺省组。
+/// one-class 滑窗打分的按模型名前缀分组的基线分位(异常分空间)。
+/// normalized = (anomaly - p50) / (p95 - p50):组内中位异常→0,95 分位(更
+/// 异常的尾部)→1,越高越异常。prefix 为 "*" 时表示全局缺省组。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OneClassBaseline {
     pub prefix: String,
-    #[serde(default)]
-    pub p05: f64,
+    /// 组内异常分中位数(normalized → 0)。
     #[serde(default)]
     pub p50: f64,
+    /// 组内 95 分位异常分(normalized → 1)。
+    #[serde(default)]
+    pub p95: f64,
 }
 
 /// 商业化路由的 one-class 决策配置(全部带默认值,不硬编码)。
+///
+/// 分数空间与标定实验(tv-research/scripts/decision_sim.py)一致:
+/// anomaly = -min_windows(TF 归一计数 · 单位质心),越高越异常;
+/// 未配置基线表时决策分 = 原始 anomaly,OPERATING_POINT.json 的阈值
+/// 可原样填入。阈值语义:score > block_threshold 拦截,score >
+/// divert_threshold 存疑(block 线必须高于 divert 线,配反自动取 max)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OneClassConfig {
     /// 模型文件名(相对 profile 目录)。
     #[serde(default = "default_oneclass_model_file")]
     pub model_file: String,
-    /// 参与打分的最大字符数(头部长度截断,防超长请求拖垮 CPU)。
+    /// 参与打分的最大字符数。默认 100_000,对齐标定实验的 MAX_CHARS
+    /// (run_oneclass2.py/decision_sim.py),超长文本分数分布不漂移。
     #[serde(default = "default_oneclass_max_scan_chars")]
     pub max_scan_chars: usize,
-    /// normalized score < block_threshold → 拦截(宁漏切勿误切,默认只拦极端异常)。
+    /// anomaly > block_threshold → 拦截。默认 2.0 不可达(anomaly∈[-1,1]),
+    /// 即未标定的模型文件绝不拦截,宁漏切勿误切。
     #[serde(default = "default_oneclass_block_threshold")]
     pub block_threshold: f64,
-    /// block_threshold <= score < divert_threshold → 存疑,走次级上游。
+    /// anomaly > divert_threshold → 存疑走次级上游。默认 2.0 不可达,
+    /// 未标定不切流。
     #[serde(default = "default_oneclass_divert_threshold")]
     pub divert_threshold: f64,
     /// 按模型名前缀分组的基线分位表(缺省组用 prefix="*")。
@@ -302,6 +313,21 @@ pub struct OneClassConfig {
     /// 高危模型线前缀列表:命中即强制送 glm 复核(优先于基础采样率)。
     #[serde(default)]
     pub review_forced_model_prefixes: Vec<String>,
+    /// glm violation=true 且 confidence >= 此值 → 拦截;低于 → 存疑切上游。
+    /// 标定值 C_BLOCK=0.85(decision_sim.py)。
+    #[serde(default = "default_oneclass_review_violation_block_conf")]
+    pub review_violation_block_conf: f64,
+    /// glm violation=false 且 confidence < 此值 且 anomaly > divert 线 →
+    /// 存疑切上游;否则豁免走主上游(高置信豁免=保缓存粘性,标定 C_GRAY=0.80)。
+    #[serde(default = "default_oneclass_review_cleared_gray_conf")]
+    pub review_cleared_gray_conf: f64,
+    /// 复核返回不可解析时的策略(对齐 OPERATING_POINT 的 none_policy):
+    /// - "self"(默认,运营点选择): 无语义判定 → 放行主上游
+    /// - "divert": 降级存疑切次级
+    /// - "fallthrough": 按分数走 R4
+    /// - "block": fail-closed 拦截
+    #[serde(default = "default_oneclass_review_unparseable_policy")]
+    pub review_unparseable_policy: String,
 }
 
 impl Default for OneClassConfig {
@@ -314,6 +340,9 @@ impl Default for OneClassConfig {
             baselines: Vec::new(),
             review_base_rate: 0.0,
             review_forced_model_prefixes: Vec::new(),
+            review_violation_block_conf: default_oneclass_review_violation_block_conf(),
+            review_cleared_gray_conf: default_oneclass_review_cleared_gray_conf(),
+            review_unparseable_policy: default_oneclass_review_unparseable_policy(),
         }
     }
 }
@@ -727,17 +756,27 @@ fn default_oneclass_model_file() -> String {
     "oneclass_model.json".to_string()
 }
 fn default_oneclass_max_scan_chars() -> usize {
-    400_000
+    // 对齐标定实验 MAX_CHARS=100_000(run_oneclass2.py:29 / decision_sim.py:56)
+    100_000
 }
-/// 默认只拦"比所在基线组最异常 5% 分位还要低半个组距"的极端请求
-/// (normalized -0.5);未配基线表时等价于原始余弦 < -0.5,基本不可能触发,
-/// 即"没配好基线就不拦",符合宁漏切勿误切。
+/// 拦截线默认 2.0:anomaly∈[-1,1] 永远打不到,即"未标定就绝不拦截"
+/// (宁漏切勿误切);真实阈值由 scripts/export_oneclass_model.py 从
+/// OPERATING_POINT.json 标定导出。
 fn default_oneclass_block_threshold() -> f64 {
-    -0.5
+    2.0
 }
-/// 默认存疑线 = 组内最异常 5% 分位(normalized 0):约 top5% 异常流量走次级上游。
+/// 存疑线默认 2.0 同理:未标定不切流,主上游缓存粘性不受影响。
 fn default_oneclass_divert_threshold() -> f64 {
-    0.0
+    2.0
+}
+fn default_oneclass_review_violation_block_conf() -> f64 {
+    0.85
+}
+fn default_oneclass_review_cleared_gray_conf() -> f64 {
+    0.80
+}
+fn default_oneclass_review_unparseable_policy() -> String {
+    "self".to_string()
 }
 fn default_true() -> bool {
     true

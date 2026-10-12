@@ -177,10 +177,10 @@ impl ModerationRoute {
 #[derive(Debug, Clone)]
 pub struct RouteDecision {
     pub route: ModerationRoute,
-    /// 归一化后的 oneclass 分(越高越合规)。
+    /// 决策分(= oneclass normalized_anomaly,越高越异常)。
     pub score: f64,
-    /// 最异常窗原始余弦分。
-    pub raw_score: f64,
+    /// 最异常窗原始异常分(anomaly = -TF·质心相似度)。
+    pub raw_anomaly: f64,
     /// 命中的基线分组。
     pub baseline_group: String,
     /// 请求模型名(用于采样与基线)。
@@ -190,12 +190,19 @@ pub struct RouteDecision {
     pub debug: ModerationDebugInfo,
 }
 
-/// 三态决策链(词库层由调用方先行,此处从 oneclass 打分开始):
-/// - score < block_threshold 或 glm 判违规 → 拦截
-/// - block_threshold <= score < divert_threshold → 存疑(次级上游)
-/// - score >= divert_threshold → 合规(主上游)
+/// 三态决策链,逐条对齐标定实验 decision_sim.decide()(OPERATING_POINT):
+/// - R2 anomaly > block_threshold → 拦截(形态极异常,硬拦,先于复核)
+/// - R3 采样送审且 glm 有判定:
+///     violation & conf >= review_violation_block_conf(0.85) → 拦截
+///     violation & conf <  0.85 → 存疑切上游
+///     cleared  & conf <  review_cleared_gray_conf(0.80) 且 anomaly >
+///              divert_threshold → 存疑切上游
+///     其余 cleared(高置信豁免)→ 主上游,保缓存粘性
+/// - R3b 复核不可解析:按 review_unparseable_policy(默认 self,运营点选择)
+/// - R4 anomaly > divert_threshold → 存疑切上游
+/// - R5 主上游
 /// glm 复核按 `review_base_rate` 基础采样 + 高危模型前缀强制采样;
-/// 复核失败只记日志不改变路由(可用性优先,风险由采样审计兜底)。
+/// 传输错误/超时按分数继续路由(可用性优先,风险由采样审计兜底)。
 ///
 /// 返回 Ok(None) 表示 oneclass 模型不可用(文件缺失/损坏):
 /// 调用方应降级为现状 smart_moderation 决策链,不影响可用性。
@@ -223,49 +230,36 @@ pub async fn route_moderation(
     };
 
     let oneclass_cfg = &profile.config.oneclass;
-    let block_threshold = oneclass_cfg.block_threshold;
-    // 阈值配反时兜底:存疑线不能低于拦截线
-    let divert_threshold = oneclass_cfg
-        .divert_threshold
-        .max(block_threshold);
+    // anomaly 取向:score > block 线拦截;block 线必须不低于 divert 线
+    let divert_threshold = oneclass_cfg.divert_threshold;
+    let block_threshold = oneclass_cfg.block_threshold.max(divert_threshold);
+    let decision_score = score.normalized_anomaly;
 
     let mut llm_reviewed = false;
     let mut llm_result: Option<String> = None;
-    // glm 复核"返回了但解析不出结论"(宽松提取重试后仍失败)。
-    // 产品决策:降级为存疑(Divert)走次级上游,而不是拦截。
-    // 理由:fail-closed(解析失败即拦)对商业化太狠——研究实测约 4.7% 的
-    // 复核返回解析失败,样本里良性请求占绝大多数,直接拦会把误拦率抬高一
-    // 个数量级(用户核心关切是宁漏切勿误切);fail-open(照常走主上游)又
-    // 等于放弃这批"本就因高风险/采样才送审"的流量,主池缓存可能被污染。
-    // 存疑引流是折中:次级上游号可弃,用户请求不失败、不误拦,主池也不接
-    // 触这批不可判定的内容。注意三点:
-    // 1. 只影响被采样送审的少数请求(review_base_rate 默认 0,未开采样则零影响);
-    // 2. 分数已判 Block 的请求在送审前就返回了,本降级不会把拦截改成存疑;
-    // 3. 传输错误/超时仍按"可用性优先,按分数继续路由"处理,不触发降级
-    //    ——那些是基础设施问题,重试即恢复;解析失败是内容问题,才值得引流。
-    let mut review_unparseable = false;
+    let mut review_verdict: Option<ReviewVerdict> = None;
 
-    if score.normalized_score < block_threshold {
-        // 极端异常直接拦截,无需 glm 确认(规则与 glm 违规是"或"的关系)
+    // R2:形态极异常直接拦截,无需 glm 确认
+    if decision_score > block_threshold {
         tracing::info!(
             model = %model_name,
-            score = score.normalized_score,
-            raw_score = score.raw_score,
+            score = decision_score,
+            raw_anomaly = score.anomaly,
             baseline_group = %score.baseline_group,
             block_threshold,
             windows = score.window_count,
             "oneclass route: block"
         );
         return Ok(Some(RouteDecision {
-            route: route_for_score(score.normalized_score, block_threshold, divert_threshold),
-            score: score.normalized_score,
-            raw_score: score.raw_score,
+            route: route_for_score(decision_score, block_threshold, divert_threshold),
+            score: decision_score,
+            raw_anomaly: score.anomaly,
             baseline_group: score.baseline_group,
             model_name: model_name.to_string(),
             llm_reviewed: false,
             debug: ModerationDebugInfo {
                 local_model_source: Some("oneclass_model".to_string()),
-                local_model_confidence: Some(score.normalized_score),
+                local_model_confidence: Some(decision_score),
                 local_model_decision: Some("block".to_string()),
                 ..Default::default()
             },
@@ -277,8 +271,18 @@ pub async fn route_moderation(
         // 已算出,这里直接复用,不重复打分),让复核优先看到最可疑区段
         let center_hint = score.anomaly_window.map(|(start, end)| (start + end) / 2);
         let truncated = profile.truncate_text_with_center(text, center_hint);
-        let verdict = if let Some(cached) = check_cache(profile_name, &truncated) {
-            Some(cached)
+        if let Some(cached) = check_cache(profile_name, &truncated) {
+            llm_reviewed = true;
+            review_verdict = Some(if cached.violation {
+                ReviewVerdict::Violation {
+                    confidence: cached.confidence.unwrap_or(0.0),
+                }
+            } else {
+                ReviewVerdict::Cleared {
+                    confidence: cached.confidence.unwrap_or(0.0),
+                }
+            });
+            llm_result = Some(if cached.violation { "block" } else { "allow" }.to_string());
         } else {
             match run_ai_moderation_with_history(
                 &truncated,
@@ -292,103 +296,138 @@ pub async fn route_moderation(
             {
                 Ok(result) => {
                     save_cache(profile_name, &truncated, &result);
-                    Some(result)
+                    llm_reviewed = true;
+                    review_verdict = Some(if result.violation {
+                        ReviewVerdict::Violation {
+                            confidence: result.confidence.unwrap_or(0.0),
+                        }
+                    } else {
+                        ReviewVerdict::Cleared {
+                            confidence: result.confidence.unwrap_or(0.0),
+                        }
+                    });
+                    llm_result =
+                        Some(if result.violation { "block" } else { "allow" }.to_string());
                 }
                 Err(err) => {
-                    // 复核是抽检,失败不阻断业务:错误进日志;
-                    // 解析失败(LlmUnparseable)降级存疑,其余按分数继续路由。
+                    // 复核是抽检,失败不阻断业务;解析失败(LlmUnparseable)是
+                    // "有内容但读不懂",按 review_unparseable_policy 处理;
+                    // 传输错误/超时是基础设施问题,按分数继续路由(R4)。
                     let message = match &err {
                         SmartModerationError::ConcurrencyLimit(message) => message.clone(),
                         SmartModerationError::LlmUnparseable(error, _) => format!("{error:#}"),
                         SmartModerationError::Other(error, _) => format!("{error:#}"),
                     };
                     if matches!(err, SmartModerationError::LlmUnparseable(..)) {
-                        review_unparseable = true;
+                        llm_reviewed = true;
+                        review_verdict = Some(ReviewVerdict::Unparseable);
+                        llm_result = Some("unparseable".to_string());
                         tracing::warn!(
                             model = %model_name,
-                            score = score.normalized_score,
+                            score = decision_score,
+                            policy = %oneclass_cfg.review_unparseable_policy,
                             error = %message,
-                            "oneclass route: glm review unparseable; degrading to divert"
+                            "oneclass route: glm review unparseable"
                         );
                     } else {
                         tracing::warn!(
                             model = %model_name,
-                            score = score.normalized_score,
+                            score = decision_score,
                             error = %message,
                             "oneclass route: glm review failed; continuing by score"
                         );
                     }
-                    None
                 }
             }
-        };
-
-        if let Some(result) = verdict {
-            llm_reviewed = true;
-            llm_result = Some(if result.violation { "block" } else { "allow" }.to_string());
-            if result.violation {
-                tracing::info!(
-                    model = %model_name,
-                    score = score.normalized_score,
-                    "oneclass route: block by glm review"
-                );
-                return Ok(Some(RouteDecision {
-                    route: ModerationRoute::Block,
-                    score: score.normalized_score,
-                    raw_score: score.raw_score,
-                    baseline_group: score.baseline_group,
-                    model_name: model_name.to_string(),
-                    llm_reviewed,
-                    debug: ModerationDebugInfo {
-                        local_model_source: Some("oneclass_model".to_string()),
-                        local_model_confidence: Some(score.normalized_score),
-                        local_model_decision: Some("uncertain".to_string()),
-                        llm_reviewed,
-                        llm_result,
-                        ..Default::default()
-                    },
-                }));
-            }
         }
     }
 
-    let mut route = route_for_score(score.normalized_score, block_threshold, divert_threshold);
-    if review_unparseable {
-        // 复核返回不可解析:合规档降为存疑(见上方产品决策注释);
-        // 存疑档维持存疑;拦截档不可能到这里(分数拦截在送审前已返回)。
-        llm_reviewed = true;
-        llm_result = Some("unparseable".to_string());
-        if route == ModerationRoute::Allow {
-            route = ModerationRoute::Divert;
-        }
-    }
+    // R3/R3b(有复核结论)或 R4(未采样/传输失败)
+    let route = match &review_verdict {
+        Some(verdict) => route_after_review(
+            verdict,
+            decision_score,
+            block_threshold,
+            divert_threshold,
+            oneclass_cfg,
+        ),
+        None => route_for_score(decision_score, block_threshold, divert_threshold),
+    };
     tracing::info!(
         model = %model_name,
         route = route.as_str(),
-        score = score.normalized_score,
-        raw_score = score.raw_score,
+        score = decision_score,
+        raw_anomaly = score.anomaly,
         baseline_group = %score.baseline_group,
         divert_threshold,
+        block_threshold,
         windows = score.window_count,
         llm_reviewed,
         "oneclass route decision"
     );
     Ok(Some(RouteDecision {
         route,
-        score: score.normalized_score,
-        raw_score: score.raw_score,
+        score: decision_score,
+        raw_anomaly: score.anomaly,
         baseline_group: score.baseline_group,
         model_name: model_name.to_string(),
         llm_reviewed,
         debug: ModerationDebugInfo {
             local_model_source: Some("oneclass_model".to_string()),
-            local_model_confidence: Some(score.normalized_score),
+            local_model_confidence: Some(decision_score),
             local_model_decision: Some(route.as_str().to_string()),
             llm_reviewed,
             llm_result,
             ..Default::default()
         },
     }))
+}
+
+/// glm 复核结论(R3 输入)。Unparseable = 返回了内容但解析不出判定。
+#[derive(Debug, Clone, Copy)]
+enum ReviewVerdict {
+    Violation { confidence: f64 },
+    Cleared { confidence: f64 },
+    Unparseable,
+}
+
+/// R3:复核结论 → 路由(逐条对齐 decision_sim.decide() 的 R3/R3b):
+/// - violation & conf >= review_violation_block_conf → Block
+/// - violation & conf 低于线 → Divert(存疑切上游,不硬拦)
+/// - cleared & conf < review_cleared_gray_conf & anomaly > divert 线 → Divert
+/// - 其余 cleared(高置信豁免)→ Allow(主上游,保缓存粘性)
+/// - Unparseable → 按 review_unparseable_policy:self/divert/fallthrough/block
+fn route_after_review(
+    verdict: &ReviewVerdict,
+    score: f64,
+    block_threshold: f64,
+    divert_threshold: f64,
+    cfg: &crate::profile::OneClassConfig,
+) -> ModerationRoute {
+    match verdict {
+        ReviewVerdict::Violation { confidence } => {
+            if *confidence >= cfg.review_violation_block_conf {
+                ModerationRoute::Block
+            } else {
+                ModerationRoute::Divert
+            }
+        }
+        ReviewVerdict::Cleared { confidence } => {
+            if *confidence < cfg.review_cleared_gray_conf && score > divert_threshold {
+                ModerationRoute::Divert
+            } else {
+                // 高置信豁免:老师明确放行,不因形态分切流(误切率标定的关键)
+                ModerationRoute::Allow
+            }
+        }
+        ReviewVerdict::Unparseable => match cfg.review_unparseable_policy.as_str() {
+            "block" => ModerationRoute::Block,
+            "divert" => ModerationRoute::Divert,
+            "fallthrough" => route_for_score(score, block_threshold, divert_threshold),
+            // "self":运营点 none_policy,无语义判定 → 放行主上游
+            _ => ModerationRoute::Allow,
+        },
+    }
 }
 
 /// glm 复核采样:高危模型前缀强制(大小写不敏感前缀匹配),
@@ -414,10 +453,12 @@ fn should_review_model(model_name: &str, cfg: &crate::profile::OneClassConfig) -
 
 /// 三态边界(规格原文):
 /// score < block → Block;block <= score < divert → Divert;score >= divert → Allow。
+/// R2/R4 的分数路由(anomaly 取向,对齐 decision_sim):
+/// score > block 线 → Block;score > divert 线 → Divert;否则 Allow。
 fn route_for_score(score: f64, block_threshold: f64, divert_threshold: f64) -> ModerationRoute {
-    if score < block_threshold {
+    if score > block_threshold {
         ModerationRoute::Block
-    } else if score < divert_threshold {
+    } else if score > divert_threshold {
         ModerationRoute::Divert
     } else {
         ModerationRoute::Allow
@@ -1403,31 +1444,115 @@ mod tests {
     #[test]
     fn route_for_score_covers_three_state_boundaries() {
         use super::{route_for_score, ModerationRoute};
-        let block = -0.5_f64;
+        // anomaly 取向:block 线 0.5 > divert 线 0.0
+        let block = 0.5_f64;
         let divert = 0.0_f64;
 
-        // score < block → 拦截
+        // score > block 线 → 拦截
         assert_eq!(
-            route_for_score(-0.5 - f64::EPSILON, block, divert),
+            route_for_score(block + 1e-9, block, divert),
             ModerationRoute::Block
         );
-        // score == block 恰好落在存疑区间(开区间下界)
+        // score == block 线恰好不拦(严格大于),落入存疑档
         assert_eq!(route_for_score(block, block, divert), ModerationRoute::Divert);
-        // 区间中段 → 存疑
-        assert_eq!(route_for_score(-0.25, block, divert), ModerationRoute::Divert);
-        // score == divert 恰好合规(闭区间上界)
+        // 存疑档中段
+        assert_eq!(route_for_score(0.25, block, divert), ModerationRoute::Divert);
+        // score == divert 线恰好不切(严格大于)
         assert_eq!(route_for_score(divert, block, divert), ModerationRoute::Allow);
-        assert_eq!(route_for_score(1.7, block, divert), ModerationRoute::Allow);
+        assert_eq!(route_for_score(-1.0, block, divert), ModerationRoute::Allow);
 
-        // 阈值配反时(divert < block)由调用方 max() 兜底;纯函数语义仍按传入值判定
+        // 阈值配反时由调用方 max() 兜底;纯函数按传入值判定
         assert_eq!(
-            route_for_score(-0.6, 0.0, -1.0),
+            route_for_score(0.9, -1.0, -2.0),
             ModerationRoute::Block,
-            "score below block still blocks even if thresholds are inverted"
+            "score above block line still blocks even if thresholds are inverted"
         );
     }
 
     #[test]
+    fn review_verdict_maps_to_route_like_decision_sim() {
+        use super::{route_after_review, ModerationRoute, ReviewVerdict};
+        use crate::profile::OneClassConfig;
+
+        let mut cfg = OneClassConfig::default(); // 0.85 / 0.80 / "self"
+        let (block, divert) = (0.5, 0.0);
+
+        let v = |violation: bool, conf: f64| {
+            if violation {
+                ReviewVerdict::Violation { confidence: conf }
+            } else {
+                ReviewVerdict::Cleared { confidence: conf }
+            }
+        };
+
+        // violation 置信分档:>=0.85 拦,低于 → 存疑
+        assert_eq!(
+            route_after_review(&v(true, 0.85), 0.9, block, divert, &cfg),
+            ModerationRoute::Block
+        );
+        assert_eq!(
+            route_after_review(&v(true, 0.99), 0.9, block, divert, &cfg),
+            ModerationRoute::Block
+        );
+        assert_eq!(
+            route_after_review(&v(true, 0.84), 0.9, block, divert, &cfg),
+            ModerationRoute::Divert
+        );
+        // 违规缺 confidence 按 0 处理 → 存疑
+        assert_eq!(
+            route_after_review(&v(true, 0.0), 0.9, block, divert, &cfg),
+            ModerationRoute::Divert
+        );
+
+        // cleared 高置信豁免:即便形态分极异常(>divert 甚至 >block)也走主上游
+        assert_eq!(
+            route_after_review(&v(false, 0.80), 0.9, block, divert, &cfg),
+            ModerationRoute::Allow,
+            "cleared & conf==0.80 (not < C_GRAY) must be exempt even with anomaly 0.9"
+        );
+        assert_eq!(
+            route_after_review(&v(false, 0.99), 0.6, block, divert, &cfg),
+            ModerationRoute::Allow
+        );
+        // cleared 低置信 + 形态异常 → 存疑;形态不异常 → 主上游
+        assert_eq!(
+            route_after_review(&v(false, 0.79), 0.9, block, divert, &cfg),
+            ModerationRoute::Divert
+        );
+        assert_eq!(
+            route_after_review(&v(false, 0.79), 0.0, block, divert, &cfg),
+            ModerationRoute::Allow,
+            "cleared low-conf but anomaly == divert line must not divert"
+        );
+
+        // Unparseable 策略
+        assert_eq!(
+            route_after_review(&ReviewVerdict::Unparseable, 0.9, block, divert, &cfg),
+            ModerationRoute::Allow,
+            "default policy self must fail-open to primary"
+        );
+        cfg.review_unparseable_policy = "divert".to_string();
+        assert_eq!(
+            route_after_review(&ReviewVerdict::Unparseable, 0.1, block, divert, &cfg),
+            ModerationRoute::Divert
+        );
+        cfg.review_unparseable_policy = "block".to_string();
+        assert_eq!(
+            route_after_review(&ReviewVerdict::Unparseable, 0.1, block, divert, &cfg),
+            ModerationRoute::Block
+        );
+        cfg.review_unparseable_policy = "fallthrough".to_string();
+        assert_eq!(
+            route_after_review(&ReviewVerdict::Unparseable, 0.25, block, divert, &cfg),
+            ModerationRoute::Divert,
+            "fallthrough must defer to score-based routing"
+        );
+        assert_eq!(
+            route_after_review(&ReviewVerdict::Unparseable, -0.5, block, divert, &cfg),
+            ModerationRoute::Allow
+        );
+    }
+
     fn review_sampling_forced_prefixes_and_base_rate() {
         let _random_guard = random_state_lock().lock().expect("random state lock");
         use super::should_review_model;
