@@ -142,6 +142,10 @@ impl LocalModelEvaluation {
 #[derive(Debug)]
 pub enum SmartModerationError {
     ConcurrencyLimit(String),
+    /// LLM 复核"返回了内容但解析不出结论 JSON"(宽松提取重试后仍失败)。
+    /// 与传输错误/超时区分开:三态路由把它降级为存疑(Divert)而非报错,
+    /// 见 route_moderation 中的产品决策注释。
+    LlmUnparseable(anyhow::Error, Option<ModerationDebugInfo>),
     Other(anyhow::Error, Option<ModerationDebugInfo>),
 }
 
@@ -227,6 +231,19 @@ pub async fn route_moderation(
 
     let mut llm_reviewed = false;
     let mut llm_result: Option<String> = None;
+    // glm 复核"返回了但解析不出结论"(宽松提取重试后仍失败)。
+    // 产品决策:降级为存疑(Divert)走次级上游,而不是拦截。
+    // 理由:fail-closed(解析失败即拦)对商业化太狠——研究实测约 4.7% 的
+    // 复核返回解析失败,样本里良性请求占绝大多数,直接拦会把误拦率抬高一
+    // 个数量级(用户核心关切是宁漏切勿误切);fail-open(照常走主上游)又
+    // 等于放弃这批"本就因高风险/采样才送审"的流量,主池缓存可能被污染。
+    // 存疑引流是折中:次级上游号可弃,用户请求不失败、不误拦,主池也不接
+    // 触这批不可判定的内容。注意三点:
+    // 1. 只影响被采样送审的少数请求(review_base_rate 默认 0,未开采样则零影响);
+    // 2. 分数已判 Block 的请求在送审前就返回了,本降级不会把拦截改成存疑;
+    // 3. 传输错误/超时仍按"可用性优先,按分数继续路由"处理,不触发降级
+    //    ——那些是基础设施问题,重试即恢复;解析失败是内容问题,才值得引流。
+    let mut review_unparseable = false;
 
     if score.normalized_score < block_threshold {
         // 极端异常直接拦截,无需 glm 确认(规则与 glm 违规是"或"的关系)
@@ -256,8 +273,10 @@ pub async fn route_moderation(
     }
 
     if should_review_model(model_name, oneclass_cfg) {
-        // glm 复核:用截断文本(与现状一致);结论只可能把路由推向拦截
-        let truncated = profile.truncate_text(text);
+        // glm 复核:用截断文本;中段对准 oneclass 最异常窗(score_request
+        // 已算出,这里直接复用,不重复打分),让复核优先看到最可疑区段
+        let center_hint = score.anomaly_window.map(|(start, end)| (start + end) / 2);
+        let truncated = profile.truncate_text_with_center(text, center_hint);
         let verdict = if let Some(cached) = check_cache(profile_name, &truncated) {
             Some(cached)
         } else {
@@ -276,17 +295,29 @@ pub async fn route_moderation(
                     Some(result)
                 }
                 Err(err) => {
-                    // 复核是抽检,失败不阻断业务:按分数继续路由,错误进日志
+                    // 复核是抽检,失败不阻断业务:错误进日志;
+                    // 解析失败(LlmUnparseable)降级存疑,其余按分数继续路由。
                     let message = match &err {
                         SmartModerationError::ConcurrencyLimit(message) => message.clone(),
+                        SmartModerationError::LlmUnparseable(error, _) => format!("{error:#}"),
                         SmartModerationError::Other(error, _) => format!("{error:#}"),
                     };
-                    tracing::warn!(
-                        model = %model_name,
-                        score = score.normalized_score,
-                        error = %message,
-                        "oneclass route: glm review failed; continuing by score"
-                    );
+                    if matches!(err, SmartModerationError::LlmUnparseable(..)) {
+                        review_unparseable = true;
+                        tracing::warn!(
+                            model = %model_name,
+                            score = score.normalized_score,
+                            error = %message,
+                            "oneclass route: glm review unparseable; degrading to divert"
+                        );
+                    } else {
+                        tracing::warn!(
+                            model = %model_name,
+                            score = score.normalized_score,
+                            error = %message,
+                            "oneclass route: glm review failed; continuing by score"
+                        );
+                    }
                     None
                 }
             }
@@ -321,7 +352,16 @@ pub async fn route_moderation(
         }
     }
 
-    let route = route_for_score(score.normalized_score, block_threshold, divert_threshold);
+    let mut route = route_for_score(score.normalized_score, block_threshold, divert_threshold);
+    if review_unparseable {
+        // 复核返回不可解析:合规档降为存疑(见上方产品决策注释);
+        // 存疑档维持存疑;拦截档不可能到这里(分数拦截在送审前已返回)。
+        llm_reviewed = true;
+        llm_result = Some("unparseable".to_string());
+        if route == ModerationRoute::Allow {
+            route = ModerationRoute::Divert;
+        }
+    }
     tracing::info!(
         model = %model_name,
         route = route.as_str(),
@@ -400,7 +440,10 @@ pub async fn smart_moderation(
         .and_then(Value::as_str)
         .unwrap_or("default");
     let profile = ModerationProfile::load(root_dir, profile_name)?;
-    let text = profile.truncate_text(text);
+    // 现状链同样受益于中段截断修复:oneclass 模型在就复用其最异常窗定位
+    // (缺失时回退全文中点)。打分只做定位用,不影响本链的决策逻辑。
+    let center_hint = oneclass::most_anomalous_window_center(text, &profile);
+    let text = profile.truncate_text_with_center(text, center_hint);
 
     if let Some(result) = check_cache(profile_name, &text) {
         return Ok(Some(result));
@@ -657,7 +700,7 @@ async fn llm_moderate(
     }
 
     let mut attempted_models = Vec::new();
-    let mut last_error = None;
+    let mut last_error: Option<SmartModerationError> = None;
     let started = Instant::now();
     for _attempt in 0..=max_retries {
         let model = pick_model_for_attempt(&models, &attempted_models);
@@ -699,28 +742,42 @@ async fn llm_moderate(
                 return Ok(parsed);
             }
             Ok(Err(err)) => {
-                let err = match err {
-                    SmartModerationError::ConcurrencyLimit(message) => anyhow!(message),
-                    SmartModerationError::Other(err, _) => err,
-                };
-                last_error = Some(err.context("llm moderation request failed"));
+                // 保留 LlmUnparseable 语义:路由层要靠它区分"读不懂"与
+                // "调不通",重试循环本身不改写错误类别。
+                last_error = Some(match err {
+                    SmartModerationError::ConcurrencyLimit(message) => {
+                        SmartModerationError::Other(
+                            anyhow!(message).context("llm moderation request failed"),
+                            None,
+                        )
+                    }
+                    SmartModerationError::LlmUnparseable(err, _) => {
+                        SmartModerationError::LlmUnparseable(
+                            err.context("llm moderation request failed"),
+                            None,
+                        )
+                    }
+                    SmartModerationError::Other(err, _) => SmartModerationError::Other(
+                        err.context("llm moderation request failed"),
+                        None,
+                    ),
+                });
             }
             Err(_) => {
-                last_error = Some(anyhow!(
-                    "llm moderation request timed out after {}s (connection aborted)",
-                    timeout.as_secs().max(1)
+                last_error = Some(SmartModerationError::Other(
+                    anyhow!(
+                        "llm moderation request timed out after {}s (connection aborted)",
+                        timeout.as_secs().max(1)
+                    ),
+                    None,
                 ));
             }
         }
     }
 
-    Err(anyhow!(
-        "llm moderation request failed: {}",
-        last_error
-            .map(|err| format!("{err:#}"))
-            .unwrap_or_else(|| "unknown error".to_string())
-    )
-    .into())
+    Err(last_error.unwrap_or_else(|| {
+        SmartModerationError::Other(anyhow!("llm moderation request failed: unknown error"), None)
+    }))
 }
 
 async fn read_openai_chat_sse_content(response: reqwest::Response) -> Result<String> {
@@ -840,11 +897,15 @@ async fn run_ai_moderation_with_history(
             debug.llm_result = Some("error".to_string());
             debug.llm_error = Some(truncate_header_value(&match &err {
                 SmartModerationError::ConcurrencyLimit(message) => message.clone(),
+                SmartModerationError::LlmUnparseable(error, _) => format!("{error:#}"),
                 SmartModerationError::Other(error, _) => format!("{error:#}"),
             }));
             return Err(match err {
                 SmartModerationError::ConcurrencyLimit(message) => {
                     SmartModerationError::Other(anyhow!(message), Some(debug))
+                }
+                SmartModerationError::LlmUnparseable(error, _) => {
+                    SmartModerationError::LlmUnparseable(error, Some(debug))
                 }
                 SmartModerationError::Other(error, _) => {
                     SmartModerationError::Other(error, Some(debug))
@@ -988,18 +1049,49 @@ fn extract_content_text(content: &Value) -> String {
     }
 }
 
+/// 解析复核返回内容:先严格提取,失败后**就地重试一次**宽松提取。
+///
+/// 可行性研究(tv-research)实测 glm 复核约 4.7% 的返回解析失败,其中
+/// 绝大多数是包裹噪声(markdown 代码块、前后缀说明文字、正文里散落的
+/// 花括号)而非模型拒答。宽松提取是对**同一响应**的确定性重解析,不发
+/// 起额外的 LLM 调用(复核请求 temperature=0,重发大概率得到同样输出,
+/// 只会白白增加延迟)。两条路径都失败才判定为不可解析(LlmUnparseable),
+/// 由路由层降级处理。
 fn parse_moderation_content(content: &str) -> Result<SmartModerationResult, SmartModerationError> {
-    let json_text = extract_json_object(content)
-        .ok_or_else(|| anyhow!("llm moderation content is not a JSON object"))?;
-    let data: Value = serde_json::from_str(json_text)
-        .map_err(|err| anyhow!(err).context("failed to decode moderation JSON"))?;
+    let unparseable = |detail: &str| {
+        SmartModerationError::LlmUnparseable(
+            anyhow!("llm moderation content is not parseable JSON: {detail}"),
+            None,
+        )
+    };
 
-    let violation = data
-        .get("violation")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| anyhow!("llm moderation response missing boolean violation"))?;
+    // 第一次(严格):整串就是 JSON,或首尾大括号截取(兼容 markdown
+    // 代码块包裹——围栏字符不是大括号,首尾截取天然跳过)。
+    if let Some(result) = extract_json_object(content).and_then(decode_moderation_json) {
+        return Ok(result);
+    }
 
-    Ok(SmartModerationResult {
+    // 重试一次(宽松):扫描平衡的 {...} 对,取第一个含 "violation" 键的
+    // 对象。可容忍:代码块包裹、JSON 前后的说明文字、说明文字里出现
+    // 花括号、JSON 之后跟着另一段带花括号的内容等。
+    if let Some(result) = extract_balanced_object_with_violation(content)
+        .and_then(decode_moderation_json)
+    {
+        return Ok(result);
+    }
+
+    Err(unparseable(&format!(
+        "len={} chars, strict and lenient extraction both failed",
+        content.chars().count()
+    )))
+}
+
+/// 把 JSON 对象文本解码为复核结论;解析失败或缺布尔 violation 键返回 None
+/// (调用方统一按"这一条提取路径失败"处理)。
+fn decode_moderation_json(json_text: &str) -> Option<SmartModerationResult> {
+    let data: Value = serde_json::from_str(json_text).ok()?;
+    let violation = data.get("violation").and_then(Value::as_bool)?;
+    Some(SmartModerationResult {
         violation,
         category: data
             .get("category")
@@ -1013,6 +1105,50 @@ fn parse_moderation_content(content: &str) -> Result<SmartModerationResult, Smar
         confidence: data.get("confidence").and_then(Value::as_f64),
         debug: None,
     })
+}
+
+/// 扫描内容中所有**平衡**的顶层 `{...}` 对,返回第一个其文本包含
+/// `"violation"` 键的对象切片。字符串字面量里的花括号不参与配对。
+fn extract_balanced_object_with_violation(content: &str) -> Option<&str> {
+    let bytes = content.as_bytes();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, &byte) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = idx;
+                }
+                depth += 1;
+            }
+            b'}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        let candidate = &content[start..=idx];
+                        if candidate.contains("\"violation\"") {
+                            return Some(candidate);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn extract_json_object(content: &str) -> Option<&str> {
@@ -1317,5 +1453,72 @@ mod tests {
         // 采样率 >= 1 全量
         cfg.review_base_rate = 1.0;
         assert!(should_review_model("any-model", &cfg));
+    }
+
+    #[test]
+    fn parse_moderation_content_strict_path_handles_bare_and_wrapped_json() {
+        use super::parse_moderation_content;
+
+        // 裸 JSON
+        let bare = parse_moderation_content("{\"violation\": true, \"reason\": \"r\"}")
+            .expect("bare json parses");
+        assert!(bare.violation);
+
+        // markdown 代码块包裹(首尾大括号截取天然兼容)
+        let fenced =
+            parse_moderation_content("```json\n{\"violation\": false, \"reason\": \"ok\"}\n```")
+                .expect("fenced json parses");
+        assert!(!fenced.violation);
+    }
+
+    #[test]
+    fn parse_moderation_content_lenient_retry_rescues_noisy_wrappers() {
+        use super::parse_moderation_content;
+
+        // 前缀说明文字带花括号 + 代码块包裹:严格首尾截取会跨到说明文字的
+        // 花括号而失败;宽松提取(平衡对象扫描)应救回。
+        let noisy_prefix = "分析如下{请注意}:\n```json\n{\"violation\": false, \"reason\": \"clean\"}\n```\n完毕";
+        let parsed = parse_moderation_content(noisy_prefix)
+            .expect("lenient retry must rescue noisy wrapper");
+        assert!(!parsed.violation);
+        assert_eq!(parsed.reason.as_deref(), Some("clean"));
+
+        // JSON 之后跟着带花括号的备注
+        let noisy_suffix = "{\"violation\": true, \"category\": \"jailbreak\"}\n备注:{略}";
+        let parsed = parse_moderation_content(noisy_suffix)
+            .expect("lenient retry must rescue trailing braces");
+        assert!(parsed.violation);
+        assert_eq!(parsed.category.as_deref(), Some("jailbreak"));
+
+        // 字符串字面量里的花括号不得破坏配对
+        let braces_in_string = "废话{a}\n{\"violation\": false, \"reason\": \"包含}花括号{测试\"}";
+        let parsed = parse_moderation_content(braces_in_string)
+            .expect("braces inside string literals must not break pairing");
+        assert!(!parsed.violation);
+
+        // 多个平衡对象:取第一个含 violation 键的
+        let multi = "前置{\"foo\": 1}后置{\"violation\": true}";
+        let parsed = parse_moderation_content(multi)
+            .expect("must pick the object containing the violation key");
+        assert!(parsed.violation);
+    }
+
+    #[test]
+    fn parse_moderation_content_reports_unparseable_after_both_attempts() {
+        use super::{parse_moderation_content, SmartModerationError};
+
+        // 纯垃圾文本:两条提取路径都失败 → LlmUnparseable(供路由层降级存疑)
+        for garbage in [
+            "GARBAGE-VERDICT not-json-text without braces +++",
+            "",
+            "{\"foo\": 1}",                       // 有 JSON 但缺 violation 布尔键
+            "{\"violation\": \"yes\"}",           // violation 非布尔
+            "只有前半个 { 括号",
+        ] {
+            match parse_moderation_content(garbage) {
+                Err(SmartModerationError::LlmUnparseable(..)) => {}
+                other => panic!("expected LlmUnparseable for {garbage:?}, got {other:?}"),
+            }
+        }
     }
 }

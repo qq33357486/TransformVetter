@@ -382,6 +382,12 @@ async fn proxy_entry_with_cfg(
                         return Err(ApiError::from(err)
                             .with_extra_headers(moderation_debug_headers(debug.as_ref())));
                     }
+                    // 现状(legacy)链没有次级上游可引流,解析失败维持既有
+                    // 行为:向上抛错(5xx)。存疑降级只属于三态路由链。
+                    Err(smart::SmartModerationError::LlmUnparseable(err, debug)) => {
+                        return Err(ApiError::from(err)
+                            .with_extra_headers(moderation_debug_headers(debug.as_ref())));
+                    }
                 }
             }
             Err(err) => return Err(map_route_error(err, moderation_format.as_str())),
@@ -552,6 +558,9 @@ fn map_route_error(err: smart::SmartModerationError, _source_format: &str) -> Ap
         )
         .with_code("MODERATION_RATE_LIMITED")
         .with_error_type("moderation_error"),
+        // LlmUnparseable 在 route_moderation 内已降级为存疑,不会走到这里;
+        // 防御性映射为与其他错误一致的 5xx。
+        smart::SmartModerationError::LlmUnparseable(error, _debug) => ApiError::from(error),
         smart::SmartModerationError::Other(error, _debug) => ApiError::from(error),
     }
 }
