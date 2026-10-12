@@ -17,3 +17,4 @@
 /run/
 /logs/
 *.log
+configs/mod_profiles/scheduler-*/
