@@ -665,7 +665,7 @@ def main():
     content += "E2ELONGTAILXYZ"       # 59986..:尾段(55000..60000)
     assert len(content) == 60000
     long_body = {"model": "e2e-16", "messages": [{"role": "user", "content": content}]}
-    with open(os.path.join(out_dir, "case16-long.json"), "w", encoding="utf-8") as fh:
+    with open(os.path.join(out_dir, "case17-long.json"), "w", encoding="utf-8") as fh:
         json.dump(long_body, fh)
 
     print(
@@ -1028,7 +1028,7 @@ case_17_long_request_truncation() {
   mock_clear
   local code out
   code=$(curl -s -o "$OUT/case17.json" -w '%{http_code}' -X POST "$TV_BASE$ROUTE" \
-    -H 'Content-Type: application/json' --data-binary @"$OUT/probes/case16-long.json")
+    -H 'Content-Type: application/json' --data-binary @"$OUT/probes/case17-long.json")
   mock_requests "$OUT/case17.requests.json"
   [ "$code" = 200 ] || { fail 17_long_request_truncation "http_code=$code"; return; }
   out=$(run_py "$E2E_DIR/helpers/assert.py" reviewprompt \
