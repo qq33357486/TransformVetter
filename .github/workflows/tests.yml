@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - deploy-harden
+      - commercial-router
   pull_request:
   workflow_dispatch:
 

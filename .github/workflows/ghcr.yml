@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - deploy-harden
+      - commercial-router
     tags:
       - 'v*'
   workflow_dispatch:
