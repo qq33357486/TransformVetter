@@ -213,6 +213,7 @@ pub async fn route_moderation(
     root_dir: &Path,
     http_client: &Client,
     env_map: &HashMap<String, String>,
+    keyword_hit: bool,
 ) -> Result<Option<RouteDecision>, SmartModerationError> {
     if !cfg.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
         return Ok(None);
@@ -266,9 +267,11 @@ pub async fn route_moderation(
         }));
     }
 
-    if should_review_model(model_name, oneclass_cfg) {
+    if should_review_model(model_name, oneclass_cfg) || keyword_hit {
         // glm 复核:用截断文本;中段对准 oneclass 最异常窗(score_request
-        // 已算出,这里直接复用,不重复打分),让复核优先看到最可疑区段
+        // 已算出,这里直接复用,不重复打分),让复核优先看到最可疑区段。
+        // keyword_hit=true 时无视采样策略强制送审:词库命中是"必审信号",
+        // 语义判定分得清引用与使用(agent 客户端 prompt 描述攻击特征的场景)。
         let center_hint = score.anomaly_window.map(|(start, end)| (start + end) / 2);
         let truncated = profile.truncate_text_with_center(text, center_hint);
         if let Some(cached) = check_cache(profile_name, &truncated) {

@@ -247,19 +247,37 @@ async fn proxy_entry_with_cfg(
     } else {
         None
     };
+    // 词库命中不再必然硬拦:keyword_review=true 且 smart 层可用时,降级为
+    // "必审信号"——强制送 glm 复核,由语义判定拦截/引流。背景:agent 客户端的
+    // system prompt 会描述攻击特征(如自带防注入规则说明),子串匹配分不清
+    // "引用"与"使用",2026-10-13 隔日校验实测 pi/OpenClaw 客户端被误伤。
+    let mut keyword_hit = false;
     if basic_mod_enabled {
-        let (moderation_format, moderation_text) = moderation_context
+        let (_moderation_format, moderation_text) = moderation_context
             .as_ref()
             .expect("moderation context when basic moderation enabled");
         if let Some(blocked) =
             basic::basic_moderation(moderation_text, &basic_mod_cfg).map_err(ApiError::from)?
         {
-            return Err(ApiError::moderation_blocked(
-                blocked.reason,
-                Some(moderation_format.as_str()),
-                None,
-            )
-            .with_extra_headers(route_header(ROUTE_BLOCKED)));
+            let soft_review = basic_mod_cfg
+                .get("keyword_review")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && smart_mod_enabled;
+            if soft_review {
+                keyword_hit = true;
+                tracing::info!(
+                    "keyword hit routed to review (keyword_review=true): {}",
+                    blocked.reason
+                );
+            } else {
+                return Err(ApiError::moderation_blocked(
+                    blocked.reason,
+                    Some(_moderation_format.as_str()),
+                    None,
+                )
+                .with_extra_headers(route_header(ROUTE_BLOCKED)));
+            }
         }
     }
     // 三态路由决策(oneclass 可用时接管 smart 层;不可用降级为现状决策链)
@@ -282,6 +300,7 @@ async fn proxy_entry_with_cfg(
             &state.settings.root_dir,
             &state.http_client,
             &state.settings.env_map,
+            keyword_hit,
         )
         .await;
         match routed {
