@@ -6,8 +6,9 @@
 #   TV_IMAGE=<被测镜像> bash scripts/e2e/run_e2e.sh
 #
 # 依赖:bash / curl / docker / python3(仅标准库)。python3 缺失时自动改用
-#       docker 运行 python:3.12-alpine 承载 mock 与断言脚本。
-# 隔离:被测容器名 tv-e2e,宿主端口仅绑 127.0.0.1:18000;不动线上任何容器。
+#       docker 运行 python:3.12-alpine 承载 mock、夹具生成与断言脚本。
+# 隔离:被测容器名 tv-e2e / tv-e2e-mock / tv-e2e-mock2,宿主端口仅绑
+#       127.0.0.1:18000/18001/18002;不动线上任何容器。
 # 输出:每用例一行 PASS/FAIL,结尾 SUMMARY: passed=N failed=M(失败退出码=失败数)
 # =============================================================================
 set -u -o pipefail
@@ -15,19 +16,26 @@ set -u -o pipefail
 # ---------- 常量与全局 ----------
 E2E_DIR=/tmp/tv-e2e
 HOST_PORT=18000                 # TV 容器在宿主的映射端口(仅 127.0.0.1)
-MOCK_PORT=18001                 # mock 上游端口
-DEAD_PORT=18099                 # 用例10:确认无监听的端口
+MOCK_PORT=18001                 # mock 主上游端口(primary + 复核)
+MOCK2_PORT=18002                # mock 次上游端口(三态路由的 secondary)
+DEAD_PORT=18099                 # 用例10/15:确认无监听的端口
 MOCK_HOST_FOR_TV=host.docker.internal
 UPSTREAM_URL="http://${MOCK_HOST_FOR_TV}:${MOCK_PORT}/v1/chat/completions"
+SECONDARY_URL="http://${MOCK_HOST_FOR_TV}:${MOCK2_PORT}/v1/chat/completions"
 DEAD_URL="http://${MOCK_HOST_FOR_TV}:${DEAD_PORT}/v1/chat/completions"
 ROUTE="/!TEST_ROUTE\$${UPSTREAM_URL}"
 ROUTE_WITH_QUERY="/!TEST_ROUTE\$${UPSTREAM_URL}%3Falpha=1%26beta=2"
 DEAD_ROUTE="/!TEST_DEAD_ROUTE\$${DEAD_URL}"
+ROUTER_LIVE_ROUTE="/!TEST_ROUTER_LIVE\$${UPSTREAM_URL}"
+ROUTER_SHADOW_ROUTE="/!TEST_ROUTER_SHADOW\$${UPSTREAM_URL}"
+ROUTER_FALLBACK_ROUTE="/!TEST_ROUTER_FALLBACK\$${UPSTREAM_URL}"
 TV_BASE="http://127.0.0.1:${HOST_PORT}"
 MOCK_BASE="http://127.0.0.1:${MOCK_PORT}"
+MOCK2_BASE="http://127.0.0.1:${MOCK2_PORT}"
 
 TV_CONTAINER=tv-e2e
 MOCK_CONTAINER=tv-e2e-mock
+MOCK2_CONTAINER=tv-e2e-mock2
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"  # 物理路径:兼容符号链接调用
 # REPO_ROOT 支持两种布局:
 #   仓库检出:  <repo>/scripts/e2e/run_e2e.sh   -> <repo>
@@ -47,6 +55,7 @@ TV_IMAGE="${TV_IMAGE:-${1:-}}"
 PASS=0
 FAIL=0
 MOCK_PID=""
+MOCK2_PID=""
 MOCK_MODE=""                    # host | docker
 PY_MODE=""                      # host | docker
 
@@ -62,9 +71,14 @@ cleanup() {
   if [ "$MOCK_MODE" = docker ]; then
     docker logs "$MOCK_CONTAINER" >"$E2E_DIR/logs/mock.log" 2>&1 || true
     docker rm -f "$MOCK_CONTAINER" >/dev/null 2>&1 || true
+    docker logs "$MOCK2_CONTAINER" >"$E2E_DIR/logs/mock2.log" 2>&1 || true
+    docker rm -f "$MOCK2_CONTAINER" >/dev/null 2>&1 || true
   fi
   if [ -n "$MOCK_PID" ]; then
     kill "$MOCK_PID" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$MOCK2_PID" ]; then
+    kill "$MOCK2_PID" >/dev/null 2>&1 || true
   fi
   note "cleanup done; logs kept under $E2E_DIR/logs"
 }
@@ -81,6 +95,8 @@ run_py() {
 
 mock_clear() { curl -s -X DELETE "$MOCK_BASE/__requests" >/dev/null 2>&1 || true; }
 mock_requests() { curl -sf "$MOCK_BASE/__requests" -o "$1" 2>/dev/null; }
+mock2_clear() { curl -s -X DELETE "$MOCK2_BASE/__requests" >/dev/null 2>&1 || true; }
+mock2_requests() { curl -sf "$MOCK2_BASE/__requests" -o "$1" 2>/dev/null; }
 
 TIME_MS_OK=0
 _probe="$(date +%s%3N 2>/dev/null || true)"
@@ -108,9 +124,9 @@ preflight() {
   if command -v docker >/dev/null 2>&1; then
     docker info >/dev/null 2>&1 || errors="${errors}docker daemon 不可用; "
   fi
-  # 端口占用预检(18000/18001 必须空闲,避免影响或被线上服务影响)
+  # 端口占用预检(18000/18001/18002 必须空闲,避免影响或被线上服务影响)
   local p
-  for p in "$HOST_PORT" "$MOCK_PORT"; do
+  for p in "$HOST_PORT" "$MOCK_PORT" "$MOCK2_PORT"; do
     if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
       exec 3>&- 3<&- || true
       errors="${errors}端口 $p 已被占用; "
@@ -135,7 +151,9 @@ prepare_workspace() {
   # 只清理本脚本拥有的子目录;精简部署布局下 $E2E_DIR 同时是部署根目录
   # (含本脚本与 configs),不能整体 rm -rf,否则自毁。
   rm -rf "$E2E_DIR/mock" "$E2E_DIR/helpers" "$E2E_DIR/out"
-  mkdir -p "$E2E_DIR"/configs/mod_profiles/e2e "$E2E_DIR"/{mock,helpers,logs,out}
+  mkdir -p "$E2E_DIR"/configs/mod_profiles/e2e \
+           "$E2E_DIR"/configs/mod_profiles/e2e-router \
+           "$E2E_DIR"/{mock,helpers,logs,out}
 
   # keywords + 复核 prompt 来自仓库(精简部署时源=目标,跳过拷贝)
   if [ "$(cd "$REPO_ROOT/configs" && pwd)" != "$(cd "$E2E_DIR/configs" && pwd)" ]; then
@@ -145,6 +163,12 @@ prepare_workspace() {
        "$E2E_DIR/configs/mod_profiles/e2e/ai_prompt.txt" ]; then
     cp "$REPO_ROOT/configs/mod_profiles/default/ai_prompt.txt" \
        "$E2E_DIR/configs/mod_profiles/e2e/ai_prompt.txt"
+  fi
+  # 三态路由 profile 的复核 prompt 同样取 default(本套件不复核,仅保持可加载)
+  if [ "$REPO_ROOT/configs/mod_profiles/default/ai_prompt.txt" != \
+       "$E2E_DIR/configs/mod_profiles/e2e-router/ai_prompt.txt" ]; then
+    cp "$REPO_ROOT/configs/mod_profiles/default/ai_prompt.txt" \
+       "$E2E_DIR/configs/mod_profiles/e2e-router/ai_prompt.txt"
   fi
 
   # 复核 profile:复用 default 结构,指向 mock 复核端点;无本地模型文件 ->
@@ -200,6 +224,9 @@ MODERATION_API_KEY=tv-e2e-fake-key
 TRAINING_SCHEDULER_ENABLED=false
 TEST_ROUTE={"format_transform":{"enabled":true,"strict_parse":false,"to":"pass_through","delay_stream_header":false},"basic_moderation":{"enabled":true,"keywords_file":"configs/keywords.txt","error_code":"BASIC_MODERATION_BLOCKED"},"smart_moderation":{"enabled":true,"profile":"e2e"}}
 TEST_DEAD_ROUTE={"format_transform":{"enabled":true,"strict_parse":false,"to":"pass_through","delay_stream_header":false},"basic_moderation":{"enabled":false},"smart_moderation":{"enabled":false}}
+TEST_ROUTER_LIVE={"format_transform":{"enabled":true,"strict_parse":false,"to":"pass_through","delay_stream_header":false},"basic_moderation":{"enabled":false},"smart_moderation":{"enabled":true,"profile":"e2e-router"},"router":{"secondary_upstream":"http://host.docker.internal:18002/v1/chat/completions","shadow_mode":false}}
+TEST_ROUTER_SHADOW={"format_transform":{"enabled":true,"strict_parse":false,"to":"pass_through","delay_stream_header":false},"basic_moderation":{"enabled":false},"smart_moderation":{"enabled":true,"profile":"e2e-router"},"router":{"secondary_upstream":"http://host.docker.internal:18002/v1/chat/completions","shadow_mode":true}}
+TEST_ROUTER_FALLBACK={"format_transform":{"enabled":true,"strict_parse":false,"to":"pass_through","delay_stream_header":false},"basic_moderation":{"enabled":false},"smart_moderation":{"enabled":true,"profile":"e2e-router"},"router":{"secondary_upstream":"http://host.docker.internal:18099/v1/chat/completions","shadow_mode":false}}
 ENV_EOF
 
   cp "$SCRIPT_DIR/mock_upstream.py" "$E2E_DIR/mock/mock_upstream.py"
@@ -349,6 +376,61 @@ def cmd_gzipreq(argv):
     print("ok")
 
 
+def cmd_routelabel(argv):
+    headers_path, expect = argv[0], argv[1]
+    with open(headers_path, "r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().splitlines()
+    got = None
+    for line in lines:
+        parts = line.split(":", 1)
+        if len(parts) == 2 and parts[0].strip().lower() == "x-prismguard-route":
+            got = parts[1].strip()
+    if got != expect:
+        die("x-prismguard-route=%r expect=%r (headers=%r)" % (got, expect, lines[:12]))
+    print("ok")
+
+
+def cmd_mockhit(argv):
+    requests_path, marker, want = argv[0], argv[1], argv[2]
+    recs = load(requests_path).get("requests", [])
+    hits = find_records(recs, marker, "/v1/chat/completions")
+    present = bool(hits)
+    if want == "present" and not present:
+        die("expected marker %r at /v1/chat/completions, got none (%d records)"
+            % (marker, len(recs)))
+    if want == "absent" and present:
+        die("marker %r must not reach this upstream (%d hits)" % (marker, len(hits)))
+    print("ok")
+
+
+def cmd_reviewprompt(argv):
+    requests_path, must_csv, must_not, sep_expect = argv[0], argv[1], argv[2], int(argv[3])
+    recs = load(requests_path).get("requests", [])
+    review = [rec for rec in recs if rec.get("path") == "/review/v1/chat/completions"]
+    if not review:
+        die("no review request recorded (%d records total)" % len(recs))
+    body = base64.b64decode(review[-1].get("body_b64", "")).decode("utf-8", "replace")
+    try:
+        payload = json.loads(body)
+        prompt = payload["messages"][0]["content"]
+        if not isinstance(prompt, str):
+            raise TypeError("content is not a string")
+    except Exception as exc:
+        die("review body unusable (%s): %r" % (exc, body[:200]))
+    problems = []
+    for marker in [m for m in must_csv.split(",") if m]:
+        if marker not in prompt:
+            problems.append("prompt missing %r" % marker)
+    if must_not and must_not in prompt:
+        problems.append("prompt must not contain %r" % must_not)
+    sep_got = prompt.count("...[中间省略]...")
+    if sep_got != sep_expect:
+        problems.append("omission separators=%d expect=%d" % (sep_got, sep_expect))
+    if problems:
+        die("; ".join(problems))
+    print("ok")
+
+
 COMMANDS = {
     "health": cmd_health,
     "urlconfig": cmd_urlconfig,
@@ -356,45 +438,299 @@ COMMANDS = {
     "passthrough": cmd_passthrough,
     "query": cmd_query,
     "gzipreq": cmd_gzipreq,
+    "routelabel": cmd_routelabel,
+    "mockhit": cmd_mockhit,
+    "reviewprompt": cmd_reviewprompt,
 }
 
 
 def main():
     if len(sys.argv) < 3 or sys.argv[1] not in COMMANDS:
-        die("usage: assert.py <health|urlconfig|errcode|passthrough|query|gzipreq> ...")
+        die("usage: assert.py <health|urlconfig|errcode|passthrough|query|gzipreq|routelabel|mockhit|reviewprompt> ...")
     COMMANDS[sys.argv[1]](sys.argv[2:])
 
 
 if __name__ == "__main__":
     main()
 ASSERT_EOF
+
+  # 三态路由夹具生成器(纯标准库):构造 oneclass 玩具模型,并按推理数学
+  # 把三份探针文本的分数经基线表精确放进 拦截/存疑/合规 三档
+  cat >"$E2E_DIR/helpers/gen_oneclass.py" <<'GEN_EOF'
+#!/usr/bin/env python3
+"""生成 e2e-router profile 的 oneclass 玩具模型与三态探针请求体。
+
+复刻 src/moderation/oneclass.rs 的推理:char 2-4 gram murmur3 哈希计数
+(与 hashlinear.rs 的 murmurhash3_x86_32 逐位一致,含 i32 unsigned_abs
+取模语义)、L2 归一质心、非重叠滑窗取最小余弦。据此把三份探针的原始分
+经基线表(p05/p50,span=0.1)精确归一化到:
+  block  probe -> normalized = -1.0  (< -0.5 拦截线)
+  divert probe -> normalized = -0.25 ([-0.5, 0.0) 存疑线)
+  allow  probe -> normalized = +0.5  (>= 0.0 合规线)
+用法: gen_oneclass.py <profile_dir> <probe_out_dir>
+"""
+import json
+import os
+import sys
+
+N_FEATURES = 262144
+WINDOW_CHARS = 512
+
+NORMAL_UNIT = "the quick brown fox jumps over the lazy dog again and again "
+ALIEN_UNIT = "zqxjwvv kkrr ttxx ppss "
+
+
+def murmur3_x86_32(data, seed=0):
+    m32 = 0xFFFFFFFF
+    c1, c2 = 0xCC9E2D51, 0x1B873593
+    length = len(data)
+    h1 = seed & m32
+    rounded_end = length & ~0x3
+    for i in range(0, rounded_end, 4):
+        k1 = data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24)
+        k1 = (k1 * c1) & m32
+        k1 = ((k1 << 15) | (k1 >> 17)) & m32
+        k1 = (k1 * c2) & m32
+        h1 ^= k1
+        h1 = ((h1 << 13) | (h1 >> 19)) & m32
+        h1 = (h1 * 5 + 0xE6546B64) & m32
+    tail = data[rounded_end:]
+    k1 = 0
+    if len(tail) >= 3:
+        k1 ^= tail[2] << 16
+    if len(tail) >= 2:
+        k1 ^= tail[1] << 8
+    if len(tail) >= 1:
+        k1 ^= tail[0]
+        k1 = (k1 * c1) & m32
+        k1 = ((k1 << 15) | (k1 >> 17)) & m32
+        k1 = (k1 * c2) & m32
+        h1 ^= k1
+    h1 = (h1 ^ length) & m32
+    h1 ^= h1 >> 16
+    h1 = (h1 * 0x85EBCA6B) & m32
+    h1 ^= h1 >> 13
+    h1 = (h1 * 0xC2B2AE35) & m32
+    h1 ^= h1 >> 16
+    return h1
+
+
+def bucket(gram):
+    h = murmur3_x86_32(gram.encode("utf-8"), 0)
+    # Rust: murmurhash3_x86_32 返回 i32,再 .unsigned_abs() as usize % n
+    signed = h - (1 << 32) if h >= (1 << 31) else h
+    return abs(signed) % N_FEATURES
+
+
+def counts_of(text):
+    lowered = text.lower()
+    counts = {}
+    top = min(4, len(lowered))
+    for n in range(2, top + 1):
+        for i in range(0, len(lowered) - n + 1):
+            idx = bucket(lowered[i:i + n])
+            counts[idx] = counts.get(idx, 0.0) + 1.0
+    return counts
+
+
+def cosine(counts, centroid_unit):
+    dot = 0.0
+    norm_sq = 0.0
+    for idx, value in counts.items():
+        norm_sq += value * value
+        weight = centroid_unit.get(idx)
+        if weight is not None:
+            dot += value * weight
+    norm = norm_sq ** 0.5
+    if norm <= 0.0:
+        return 1.0
+    return dot / norm
+
+
+def raw_score(text, centroid_unit):
+    """非重叠滑窗取最小余弦(与 oneclass.rs score_windows 一致)。"""
+    chars = list(text)
+    best = None
+    for start in range(0, len(chars), WINDOW_CHARS):
+        window = "".join(chars[start:start + WINDOW_CHARS])
+        value = cosine(counts_of(window), centroid_unit)
+        if best is None or value < best:
+            best = value
+    return 1.0 if best is None else best
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("usage: gen_oneclass.py <profile_dir> <probe_out_dir>", file=sys.stderr)
+        sys.exit(2)
+    profile_dir, out_dir = sys.argv[1], sys.argv[2]
+    os.makedirs(profile_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 质心 = 正常文本的 gram 计数方向(Rust 加载时做 L2 归一)
+    centroid_counts = counts_of(NORMAL_UNIT)
+    norm = sum(v * v for v in centroid_counts.values()) ** 0.5
+    centroid_unit = {k: v / norm for k, v in centroid_counts.items()}
+
+    # 三份探针都控制在单窗以内(<512 字符),分数即该窗余弦,完全确定
+    allow_text = "e2e-probe-allow " + NORMAL_UNIT * 8
+    block_text = "e2e-probe-block " + ALIEN_UNIT * 18
+    divert_text = "e2e-probe-divert " + NORMAL_UNIT * 4 + ALIEN_UNIT * 8
+    for name, text in (("allow", allow_text), ("block", block_text), ("divert", divert_text)):
+        if len(text) >= WINDOW_CHARS:
+            print("probe %s too long: %d" % (name, len(text)), file=sys.stderr)
+            sys.exit(1)
+
+    r_allow = raw_score(allow_text, centroid_unit)
+    r_block = raw_score(block_text, centroid_unit)
+    r_divert = raw_score(divert_text, centroid_unit)
+    # 探针分数必须有明确的档位间距,否则夹具失效
+    if not (r_block + 0.15 < r_divert < r_allow - 0.15):
+        print(
+            "probe scores too close: block=%r divert=%r allow=%r" % (r_block, r_divert, r_allow),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    span = 0.1
+    baselines = [
+        # p05 = raw + 0.1 -> normalized(raw) = -1.0 < -0.5 → 拦截
+        {"prefix": "e2e-router-block", "p05": r_block + span, "p50": r_block + 2 * span},
+        # p05 = raw + 0.025 -> normalized(raw) = -0.25 ∈ [-0.5, 0) → 存疑
+        {"prefix": "e2e-router-divert", "p05": r_divert + 0.025, "p50": r_divert + 0.125},
+        # p05 = raw - 0.05 -> normalized(raw) = +0.5 >= 0 → 合规
+        {"prefix": "e2e-router-allow", "p05": r_allow - 0.05, "p50": r_allow + 0.05},
+        # 缺省组:任意原始分归一化到 (r+2)/5 ∈ [0.4, 0.6] → 合规
+        {"prefix": "*", "p05": -2.0, "p50": 3.0},
+    ]
+
+    model = {
+        "runtime_version": 1,
+        "window_chars": WINDOW_CHARS,
+        "ngram_range": [2, 4],
+        "n_features": N_FEATURES,
+        "lowercase": True,
+        "alternate_sign": False,
+        "centroid": {str(k): v for k, v in centroid_counts.items()},
+    }
+    with open(os.path.join(profile_dir, "oneclass_model.json"), "w", encoding="utf-8") as fh:
+        json.dump(model, fh)
+
+    profile = {
+        "ai": {
+            "provider": "openai",
+            "base_url": "http://host.docker.internal:18001/review/v1",
+            "model": "mock-review-model",
+            "api_key_env": "MODERATION_API_KEY",
+            "timeout": 10,
+            "max_retries": 0,
+        },
+        "prompt": {"template_file": "ai_prompt.txt", "max_text_length": 30000},
+        "probability": {
+            "ai_review_rate": 0.0,
+            "random_seed": 42,
+            "low_risk_threshold": 0.30,
+            "high_risk_threshold": 0.50,
+            "enable_concurrency_limit_fallback": False,
+        },
+        "local_model_type": "hashlinear",
+        "oneclass": {
+            "model_file": "oneclass_model.json",
+            "block_threshold": -0.5,
+            "divert_threshold": 0.0,
+            "review_base_rate": 0.0,
+            "review_forced_model_prefixes": [],
+            "baselines": baselines,
+        },
+    }
+    with open(os.path.join(profile_dir, "profile.json"), "w", encoding="utf-8") as fh:
+        json.dump(profile, fh, indent=1)
+
+    probes = {
+        "block": {"model": "e2e-router-block", "messages": [{"role": "user", "content": block_text}]},
+        "divert": {"model": "e2e-router-divert", "messages": [{"role": "user", "content": divert_text}]},
+        "allow": {"model": "e2e-router-allow", "messages": [{"role": "user", "content": allow_text}]},
+    }
+    for name, body in probes.items():
+        with open(os.path.join(out_dir, "probe-%s.json" % name), "w", encoding="utf-8") as fh:
+            json.dump(body, fh)
+
+    # 用例16:60K 字符长请求,标记位于 头/中段(中点)/尾 与丢弃区
+    content = "E2ELONGHEADXYZ"
+    content += "a" * (18000 - len(content))
+    content += "E2ELONGDROPXYZ"       # 18000..:丢弃区(15000..25000)
+    content += "b" * (29990 - len(content))
+    content += "E2ELONGMIDXYZ"        # 29990..:中段窗(25000..35000)
+    content += "c" * (59986 - len(content))
+    content += "E2ELONGTAILXYZ"       # 59986..:尾段(55000..60000)
+    assert len(content) == 60000
+    long_body = {"model": "e2e-16", "messages": [{"role": "user", "content": content}]}
+    with open(os.path.join(out_dir, "case16-long.json"), "w", encoding="utf-8") as fh:
+        json.dump(long_body, fh)
+
+    print(
+        "gen_oneclass: block=%.4f divert=%.4f allow=%.4f" % (r_block, r_divert, r_allow)
+    )
+
+
+if __name__ == "__main__":
+    main()
+GEN_EOF
+}
+
+# 生成三态路由夹具(mock 就绪后调用,复用 run_py 的 host/docker python)
+generate_router_fixtures() {
+  run_py "$E2E_DIR/helpers/gen_oneclass.py" \
+    "$E2E_DIR/configs/mod_profiles/e2e-router" "$E2E_DIR/out/probes" || return 1
+  for f in oneclass_model.json profile.json; do
+    if [ ! -s "$E2E_DIR/configs/mod_profiles/e2e-router/$f" ]; then
+      note "缺少 $f"
+      return 1
+    fi
+  done
+  for p in block divert allow; do
+    if [ ! -s "$E2E_DIR/out/probes/probe-$p.json" ]; then
+      note "缺少 probe-$p.json"
+      return 1
+    fi
+  done
+  return 0
 }
 
 # ---------- 启动 mock 与被测容器 ----------
-start_mock() {
+start_mocks() {
+  # mock1:主上游 + 复核端点;mock2:三态路由的次上游(secondary)
   if command -v python3 >/dev/null 2>&1; then
     MOCK_MODE=host
     PY_MODE=host
     python3 "$E2E_DIR/mock/mock_upstream.py" >"$E2E_DIR/logs/mock.log" 2>&1 &
     MOCK_PID=$!
+    MOCK_PORT=$MOCK2_PORT python3 "$E2E_DIR/mock/mock_upstream.py" >"$E2E_DIR/logs/mock2.log" 2>&1 &
+    MOCK2_PID=$!
   else
     MOCK_MODE=docker
     PY_MODE=docker
-    note "宿主无 python3,改用 docker python:3.12-alpine 运行 mock(会临时发布 0.0.0.0:$MOCK_PORT)"
+    note "宿主无 python3,改用 docker python:3.12-alpine 运行 mock(会临时发布 0.0.0.0:$MOCK_PORT/$MOCK2_PORT)"
     docker pull -q python:3.12-alpine >/dev/null || return 1
     docker run -d --name "$MOCK_CONTAINER" \
       -v "$E2E_DIR":"$E2E_DIR" \
       -p "$MOCK_PORT:$MOCK_PORT" \
       python:3.12-alpine python "$E2E_DIR/mock/mock_upstream.py" >/dev/null || return 1
+    docker run -d --name "$MOCK2_CONTAINER" \
+      -v "$E2E_DIR":"$E2E_DIR" \
+      -e MOCK_PORT="$MOCK2_PORT" \
+      -p "$MOCK2_PORT:$MOCK2_PORT" \
+      python:3.12-alpine python "$E2E_DIR/mock/mock_upstream.py" >/dev/null || return 1
   fi
   local i
   for i in $(seq 1 30); do
-    if curl -sf "$MOCK_BASE/healthz" >/dev/null 2>&1; then
+    if curl -sf "$MOCK_BASE/healthz" >/dev/null 2>&1 \
+       && curl -sf "$MOCK2_BASE/healthz" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
   done
-  echo "mock 未在 30s 内就绪(见 $E2E_DIR/logs/mock.log)"
+  echo "mock 未在 30s 内就绪(见 $E2E_DIR/logs/mock.log 与 mock2.log)"
   return 1
 }
 
@@ -595,6 +931,117 @@ case_11_perf() {
   fi
 }
 
+# ---------- 用例:商业化三态路由(12-17)----------
+
+# 12:拦截档探针 → 400 MODERATION_BLOCKED,流量不出门
+case_12_router_block() {
+  mock_clear
+  local code out
+  code=$(curl -s -o "$OUT/case12.json" -w '%{http_code}' -X POST "$TV_BASE$ROUTER_LIVE_ROUTE" \
+    -H 'Content-Type: application/json' --data-binary @"$OUT/probes/probe-block.json")
+  mock_requests "$OUT/case12.requests.json"
+  out=$(run_py "$E2E_DIR/helpers/assert.py" errcode "$OUT/case12.json" "$code" 400 MODERATION_BLOCKED 2>&1)
+  if [ "$out" != ok ]; then
+    fail 12_router_three_state_block "$out"
+    return
+  fi
+  out=$(run_py "$E2E_DIR/helpers/assert.py" mockhit "$OUT/case12.requests.json" e2e-probe-block absent 2>&1)
+  if [ "$out" = ok ]; then
+    ok 12_router_three_state_block
+  else
+    fail 12_router_three_state_block "$out"
+  fi
+}
+
+# 13:存疑档探针(shadow 关)→ 真切到次上游;主上游零接触
+case_13_router_divert_live() {
+  mock_clear; mock2_clear
+  local code out
+  code=$(curl -s -D "$OUT/case13.headers" -o "$OUT/case13.json" -w '%{http_code}' -X POST "$TV_BASE$ROUTER_LIVE_ROUTE" \
+    -H 'Content-Type: application/json' --data-binary @"$OUT/probes/probe-divert.json")
+  mock_requests "$OUT/case13.requests.json"
+  mock2_requests "$OUT/case13.requests2.json"
+  [ "$code" = 200 ] || { fail 13_router_divert_to_secondary "http_code=$code"; return; }
+  out=$(run_py "$E2E_DIR/helpers/assert.py" routelabel "$OUT/case13.headers" secondary 2>&1)
+  [ "$out" = ok ] || { fail 13_router_divert_to_secondary "$out"; return; }
+  out=$(run_py "$E2E_DIR/helpers/assert.py" mockhit "$OUT/case13.requests2.json" e2e-probe-divert present 2>&1)
+  [ "$out" = ok ] || { fail 13_router_divert_to_secondary "$out"; return; }
+  out=$(run_py "$E2E_DIR/helpers/assert.py" mockhit "$OUT/case13.requests.json" e2e-probe-divert absent 2>&1)
+  [ "$out" = ok ] || { fail 13_router_divert_to_secondary "$out"; return; }
+  ok 13_router_divert_to_secondary
+}
+
+# 14:存疑档探针 + 影子模式 → 只打标,实际走主上游,次上游零接触
+case_14_router_divert_shadow() {
+  mock_clear; mock2_clear
+  local code out
+  code=$(curl -s -D "$OUT/case14.headers" -o "$OUT/case14.json" -w '%{http_code}' -X POST "$TV_BASE$ROUTER_SHADOW_ROUTE" \
+    -H 'Content-Type: application/json' --data-binary @"$OUT/probes/probe-divert.json")
+  mock_requests "$OUT/case14.requests.json"
+  mock2_requests "$OUT/case14.requests2.json"
+  [ "$code" = 200 ] || { fail 14_router_shadow_records_only "http_code=$code"; return; }
+  out=$(run_py "$E2E_DIR/helpers/assert.py" routelabel "$OUT/case14.headers" shadow-secondary 2>&1)
+  [ "$out" = ok ] || { fail 14_router_shadow_records_only "$out"; return; }
+  out=$(run_py "$E2E_DIR/helpers/assert.py" mockhit "$OUT/case14.requests.json" e2e-probe-divert present 2>&1)
+  [ "$out" = ok ] || { fail 14_router_shadow_records_only "$out"; return; }
+  out=$(run_py "$E2E_DIR/helpers/assert.py" mockhit "$OUT/case14.requests2.json" e2e-probe-divert absent 2>&1)
+  [ "$out" = ok ] || { fail 14_router_shadow_records_only "$out"; return; }
+  ok 14_router_shadow_records_only
+}
+
+# 15:次级上游连接拒绝 → 回退主上游,标 secondary-fallback-primary
+case_15_router_secondary_fallback() {
+  mock_clear; mock2_clear
+  local code out
+  code=$(curl -s -D "$OUT/case15.headers" -o "$OUT/case15.json" -w '%{http_code}' -X POST "$TV_BASE$ROUTER_FALLBACK_ROUTE" \
+    -H 'Content-Type: application/json' --data-binary @"$OUT/probes/probe-divert.json")
+  mock_requests "$OUT/case15.requests.json"
+  [ "$code" = 200 ] || { fail 15_router_secondary_fallback_primary "http_code=$code"; return; }
+  out=$(run_py "$E2E_DIR/helpers/assert.py" routelabel "$OUT/case15.headers" secondary-fallback-primary 2>&1)
+  [ "$out" = ok ] || { fail 15_router_secondary_fallback_primary "$out"; return; }
+  out=$(run_py "$E2E_DIR/helpers/assert.py" mockhit "$OUT/case15.requests.json" e2e-probe-divert present 2>&1)
+  [ "$out" = ok ] || { fail 15_router_secondary_fallback_primary "$out"; return; }
+  ok 15_router_secondary_fallback_primary
+}
+
+# 16:合规档探针 → 主上游;顺带验证 allow 档走 primary 标签
+case_16_router_allow_primary() {
+  mock_clear; mock2_clear
+  local code out
+  code=$(curl -s -D "$OUT/case16.headers" -o "$OUT/case16.json" -w '%{http_code}' -X POST "$TV_BASE$ROUTER_LIVE_ROUTE" \
+    -H 'Content-Type: application/json' --data-binary @"$OUT/probes/probe-allow.json")
+  mock_requests "$OUT/case16.requests.json"
+  mock2_requests "$OUT/case16.requests2.json"
+  [ "$code" = 200 ] || { fail 16_router_allow_primary "http_code=$code"; return; }
+  out=$(run_py "$E2E_DIR/helpers/assert.py" routelabel "$OUT/case16.headers" primary 2>&1)
+  [ "$out" = ok ] || { fail 16_router_allow_primary "$out"; return; }
+  out=$(run_py "$E2E_DIR/helpers/assert.py" mockhit "$OUT/case16.requests.json" e2e-probe-allow present 2>&1)
+  [ "$out" = ok ] || { fail 16_router_allow_primary "$out"; return; }
+  out=$(run_py "$E2E_DIR/helpers/assert.py" mockhit "$OUT/case16.requests2.json" e2e-probe-allow absent 2>&1)
+  [ "$out" = ok ] || { fail 16_router_allow_primary "$out"; return; }
+  ok 16_router_allow_primary
+}
+
+# 17:60K 字符请求 → 30K 截断(头15K+中段10K+尾5K)后送复核:
+#     头/中/尾标记都在,丢弃区标记不在,恰好两个省略分隔符
+case_17_long_request_truncation() {
+  mock_clear
+  local code out
+  code=$(curl -s -o "$OUT/case17.json" -w '%{http_code}' -X POST "$TV_BASE$ROUTE" \
+    -H 'Content-Type: application/json' --data-binary @"$OUT/probes/case16-long.json")
+  mock_requests "$OUT/case17.requests.json"
+  [ "$code" = 200 ] || { fail 17_long_request_truncation "http_code=$code"; return; }
+  out=$(run_py "$E2E_DIR/helpers/assert.py" reviewprompt \
+    "$OUT/case17.requests.json" \
+    "E2ELONGHEADXYZ,E2ELONGMIDXYZ,E2ELONGTAILXYZ" \
+    "E2ELONGDROPXYZ" 2 2>&1)
+  if [ "$out" = ok ]; then
+    ok 17_long_request_truncation
+  else
+    fail 17_long_request_truncation "$out"
+  fi
+}
+
 # ---------- 主流程 ----------
 main() {
   echo "== TransformVetter E2E =="
@@ -608,8 +1055,13 @@ main() {
   fi
 
   prepare_workspace || { fail 00_setup "prepare_workspace 失败"; echo "SUMMARY: passed=$PASS failed=$FAIL"; exit 1; }
-  if ! start_mock; then
+  if ! start_mocks; then
     fail 00_setup "mock 启动失败"
+    echo "SUMMARY: passed=$PASS failed=$FAIL"
+    exit 1
+  fi
+  if ! generate_router_fixtures; then
+    fail 00_setup "oneclass 三态夹具生成失败"
     echo "SUMMARY: passed=$PASS failed=$FAIL"
     exit 1
   fi
@@ -631,6 +1083,12 @@ main() {
   case_09_review_garbage
   case_10_upstream_refused
   case_11_perf
+  case_12_router_block
+  case_13_router_divert_live
+  case_14_router_divert_shadow
+  case_15_router_secondary_fallback
+  case_16_router_allow_primary
+  case_17_long_request_truncation
 
   echo "SUMMARY: passed=$PASS failed=$FAIL"
   [ "$FAIL" -eq 0 ] || exit "$FAIL"

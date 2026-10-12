@@ -410,3 +410,38 @@ fn default_ngram_range() -> Vec<usize> {
 fn default_true() -> bool {
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::murmurhash3_x86_32;
+
+    /// 参考向量锁定 murmur3 实现的位级行为:前两条与最后一组(UTF-8 多字节)
+    /// 由 scripts/e2e/helpers/gen_oneclass.py 的独立实现交叉验证,保证 e2e
+    /// 夹具生成器(python)与本实现(hashlinear.rs)逐位一致;("",1) 与
+    /// ("hello",0) 同时是社区公认参考值。尾部长度 0/1/2/3 与多块路径全覆盖。
+    #[test]
+    fn murmur3_reference_vectors_cover_all_tail_lengths() {
+        let vectors: &[(&[u8], u32, i32)] = &[
+            (b"", 0, 0),
+            (b"", 1, 1364076727),
+            (b"hello", 0, 613153351),
+            (b"abc", 0, -1277324294),
+            (b"ab", 0, -1681926305),
+            (b"a", 0, 1009084850),
+            (b"abcdefgh", 0, 1239272644),
+            (b"xxxx", 0, -1416638653),
+            (b"hello", 1, -1152729939),
+            (b"e2e-probe-allow the quick brown", 0, -1693453932),
+            ("中段藏毒检测".as_bytes(), 0, 1697527102),
+            (b"zqxjwvv kkrr ttxx ppss zqxjwvv", 0, 1808102993),
+        ];
+        for (data, seed, expected) in vectors {
+            assert_eq!(
+                murmurhash3_x86_32(data, *seed),
+                *expected,
+                "murmur3({:?}, seed={seed}) mismatch",
+                String::from_utf8_lossy(data)
+            );
+        }
+    }
+}

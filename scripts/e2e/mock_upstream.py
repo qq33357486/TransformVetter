@@ -36,6 +36,9 @@ from urllib.parse import urlsplit
 PORT = int(os.environ.get("MOCK_PORT", "18001"))
 MAX_RECORDS = 5000
 BODY_SNIPPET_BYTES = 2048
+# 复核请求的 prompt 可达数十 KB(截断后的头/中/尾三段),默认 2KB 片段
+# 不够断言用:复核路径按此上限保真录制
+REVIEW_SNIPPET_BYTES = 262144
 SSE_INTERVAL = 0.5
 
 MOCK_REPLY_TEXT = "mock non-stream reply"
@@ -45,7 +48,7 @@ _lock = threading.Lock()
 _rec_seq = 0
 
 
-def record_request(method, path, query, header_items, body):
+def record_request(method, path, query, header_items, body, snippet_bytes=BODY_SNIPPET_BYTES):
     """把一个请求追加进内存记录,返回该条记录(dict,可继续补充字段)。"""
     global _rec_seq
     with _lock:
@@ -58,8 +61,8 @@ def record_request(method, path, query, header_items, body):
             "query": query or "",
             "headers": {name.lower(): value for name, value in header_items},
             "body_len": len(body),
-            "body_b64": base64.b64encode(body[:BODY_SNIPPET_BYTES]).decode("ascii"),
-            "body_preview": body[:BODY_SNIPPET_BYTES].decode("utf-8", "replace"),
+            "body_b64": base64.b64encode(body[:snippet_bytes]).decode("ascii"),
+            "body_preview": body[:snippet_bytes].decode("utf-8", "replace"),
             "stream_completed": None,
         }
         _records.append(rec)
@@ -134,7 +137,8 @@ class Handler(BaseHTTPRequestHandler):
         raw = self._read_body()
         parsed = urlsplit(self.path)
         path, query = parsed.path, parsed.query
-        rec = record_request("POST", path, query, self.headers.items(), raw)
+        snippet = REVIEW_SNIPPET_BYTES if path == "/review/v1/chat/completions" else BODY_SNIPPET_BYTES
+        rec = record_request("POST", path, query, self.headers.items(), raw, snippet)
 
         if path == "/v1/chat/completions":
             self._handle_business(self._parse_json_obj(raw), rec)

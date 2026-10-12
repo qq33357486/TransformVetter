@@ -6044,6 +6044,336 @@ async fn commercial_router_blocks_extreme_score_with_route_header() {
     assert!(primary_seen.lock().expect("primary seen").is_empty());
 }
 
+/// 复核返回不可解析(宽松提取重试后仍失败)→ 三态链降级为存疑走次级上游,
+/// 而不是拦截(fail-closed)或照常走主上游(fail-open)。
+#[tokio::test]
+async fn commercial_router_unparseable_review_degrades_to_divert() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
+    let profile_name =
+        format!("commercial-unparseable-{}-{}", std::process::id(), unique_test_suffix());
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
+
+    // LLM mock 返回纯垃圾文本(无任何 JSON)
+    let (llm_base, _hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {"content": "GARBAGE-VERDICT not-json-text without braces +++"}
+        }]
+    }))
+    .await;
+
+    // 分数落合规档(block=-100 < score,divert=-50 <= score),复核由高危
+    // 前缀强制触发;复核解析失败后应把合规档降为存疑
+    write_commercial_review_profile(&profile_dir, -100.0, -50.0, llm_base, &["claude-sonnet"]);
+    write_minimal_oneclass_model(&profile_dir);
+
+    let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
+    let (secondary_base, secondary_seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {"enabled": true, "profile": profile_name},
+            "router": {
+                "secondary_upstream": format!("{secondary_base}/v1/chat/completions"),
+                "shadow_mode": false
+            }
+        })
+        .to_string(),
+    );
+
+    let response = post_commercial_request(&proxy_base, &config, &primary_base).await;
+
+    assert_eq!(response.status(), StatusCode::OK, "unparseable review must not fail the request");
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-route")
+            .and_then(|value| value.to_str().ok()),
+        Some("secondary"),
+        "unparseable review must degrade to divert (secondary), not block"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-llm-result")
+            .and_then(|value| value.to_str().ok()),
+        Some("unparseable")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-llm-reviewed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        primary_seen.lock().expect("primary seen").len(),
+        0,
+        "degraded divert must not touch the primary pool"
+    );
+    assert!(
+        secondary_seen.lock().expect("secondary seen").len() >= 1,
+        "degraded divert must hit the disposable secondary upstream"
+    );
+}
+
+/// 复核返回被 markdown 代码块 + 噪声花括号包裹的违规 JSON:
+/// 宽松提取(平衡对象扫描)应救回结论并拦截。
+#[tokio::test]
+async fn commercial_router_lenient_parse_blocks_via_glm_review() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
+    let profile_name =
+        format!("commercial-lenient-{}-{}", std::process::id(), unique_test_suffix());
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
+
+    // 前缀说明文字自带花括号 + 代码块包裹:严格"首尾大括号"截取必然失败,
+    // 只有宽松提取能拿到结论
+    let (llm_base, _hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {"content": "分析如下{请注意}:\n```json\n{\"violation\": true, \"category\": \"jailbreak\", \"reason\": \"mock\"}\n```\n完毕"}
+        }]
+    }))
+    .await;
+
+    write_commercial_review_profile(&profile_dir, -100.0, -50.0, llm_base, &["claude-sonnet"]);
+    write_minimal_oneclass_model(&profile_dir);
+
+    let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
+    let (secondary_base, _secondary_seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {"enabled": true, "profile": profile_name},
+            "router": {
+                "secondary_upstream": format!("{secondary_base}/v1/chat/completions"),
+                "shadow_mode": false
+            }
+        })
+        .to_string(),
+    );
+
+    let response = post_commercial_request(&proxy_base, &config, &primary_base).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-route")
+            .and_then(|value| value.to_str().ok()),
+        Some("blocked")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-llm-result")
+            .and_then(|value| value.to_str().ok()),
+        Some("block"),
+        "leniently extracted violation must surface as a review block"
+    );
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
+    assert!(primary_seen.lock().expect("primary seen").is_empty());
+}
+
+/// 截断修复的端到端验证:60K 字符请求经 30K 截断(头15K+中段10K+尾5K,
+/// 无 oneclass 模型时中段取中点)后,送复核的提示词必须保留
+/// 头/中/尾三段标记,且丢弃区标记不出现。
+#[tokio::test]
+async fn smart_moderation_truncation_keeps_head_mid_and_tail_segments() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
+    let profile_name = format!("smart-truncate-{}-{}", std::process::id(), unique_test_suffix());
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
+
+    let (llm_base, captured) = spawn_capturing_openai_chat_server(json!({
+        "choices": [{
+            "message": {"content": "{\"violation\": false, \"category\": null, \"reason\": \"clean\"}"}
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 10,
+                "max_retries": 0
+            },
+            "prompt": {"template_file": "ai_prompt.txt", "max_text_length": 30000},
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本:{{text}}").expect("write prompt");
+
+    // 60000 字符:头段 0..15000,中段(中点)25000..35000,尾段 55000..60000
+    let mut content = String::from("E2ELONGHEADXYZ");
+    while content.chars().count() < 18000 {
+        content.push('a');
+    }
+    content.push_str("E2ELONGDROPXYZ"); // 18000..:落在丢弃区 15000..25000
+    while content.chars().count() < 29990 {
+        content.push('b');
+    }
+    content.push_str("E2ELONGMIDXYZ"); // 29990..:落在中段窗 25000..35000
+    while content.chars().count() < 59986 {
+        content.push('c');
+    }
+    content.push_str("E2ELONGTAILXYZ"); // 59986..:落在尾段 55000..60000
+    assert_eq!(content.chars().count(), 60000);
+
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {"enabled": true, "profile": profile_name}
+        })
+        .to_string(),
+    );
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": content}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(seen.lock().expect("upstream seen").len() >= 1);
+
+    let captured = captured.lock().expect("captured lock");
+    let review = captured
+        .last()
+        .expect("review request captured");
+    let prompt = review["messages"][0]["content"]
+        .as_str()
+        .expect("review prompt content");
+    for marker in ["E2ELONGHEADXYZ", "E2ELONGMIDXYZ", "E2ELONGTAILXYZ"] {
+        assert!(
+            prompt.contains(marker),
+            "review prompt must contain {marker} (head/middle/tail all kept)"
+        );
+    }
+    assert!(
+        !prompt.contains("E2ELONGDROPXYZ"),
+        "marker inside the dropped zone must not reach the reviewer"
+    );
+    assert_eq!(
+        prompt.matches("...[中间省略]...").count(),
+        2,
+        "expected exactly two omission separators (three kept segments)"
+    );
+}
+
+/// 记录完整请求体(抽取 messages[0].content 用)的 LLM mock。
+async fn spawn_capturing_openai_chat_server(
+    response_body: Value,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let app_captured = captured.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: Option<Json<Value>>| {
+            let response_body = response_body.clone();
+            let captured = app_captured.clone();
+            async move {
+                if let Some(Json(value)) = body {
+                    captured.lock().expect("captured lock").push(value);
+                }
+                (AxumStatusCode::OK, Json(response_body))
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind capturing openai chat server");
+    let addr = listener.local_addr().expect("capturing openai chat addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("capturing openai chat server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (format!("http://{}", addr), captured)
+}
+
+/// 商业化路由链的复核型 profile:阈值把分数放进合规档,复核由
+/// review_forced_model_prefixes 强制触发。
+fn write_commercial_review_profile(
+    profile_dir: &std::path::Path,
+    block_threshold: f64,
+    divert_threshold: f64,
+    llm_base: String,
+    forced_prefixes: &[&str],
+) {
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 5,
+                "max_retries": 0
+            },
+            "prompt": {"template_file": "ai_prompt.txt", "max_text_length": 4000},
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            },
+            "oneclass": {
+                "block_threshold": block_threshold,
+                "divert_threshold": divert_threshold,
+                "review_base_rate": 0.0,
+                "review_forced_model_prefixes": forced_prefixes
+            }
+        })
+        .to_string(),
+    )
+    .expect("write commercial review profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本:{{text}}").expect("write prompt");
+}
+
 #[tokio::test]
 async fn commercial_router_degrades_to_legacy_chain_without_oneclass_model() {
     let _llm_gate = llm_test_gate().lock().expect("llm test gate");
