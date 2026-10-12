@@ -102,7 +102,8 @@ pub fn model_path(profile: &ModerationProfile) -> PathBuf {
         .join(&profile.config.oneclass.model_file)
 }
 
-/// 模型文件是否存在(不触发加载与解析)。
+/// 模型文件是否存在(不触发加载与解析;预检/运维探针用)。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn model_exists(profile: &ModerationProfile) -> bool {
     model_path(profile).exists()
 }

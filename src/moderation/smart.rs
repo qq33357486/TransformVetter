@@ -1181,8 +1181,16 @@ mod tests {
         cache.lock().expect("moderation cache").clear();
     }
 
+    /// set_test_random_values 是进程级共享队列:使用它的测试必须互斥,
+    /// 否则并行测试会互抢对方的抽样值。
+    fn random_state_lock() -> &'static Mutex<()> {
+        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     #[test]
     fn ai_review_rate_uses_fresh_request_time_random_draws() {
+        let _random_guard = random_state_lock().lock().expect("random state lock");
         let mut profile = test_profile();
         profile.config.probability.ai_review_rate = 0.5;
 
@@ -1194,6 +1202,7 @@ mod tests {
 
     #[test]
     fn retry_model_selection_prefers_untried_models_before_repeats() {
+        let _random_guard = random_state_lock().lock().expect("random state lock");
         let models = vec![
             "model-a".to_string(),
             "model-b".to_string(),
@@ -1284,6 +1293,7 @@ mod tests {
 
     #[test]
     fn review_sampling_forced_prefixes_and_base_rate() {
+        let _random_guard = random_state_lock().lock().expect("random state lock");
         use super::should_review_model;
         use crate::profile::OneClassConfig;
 
