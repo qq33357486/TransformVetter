@@ -5813,6 +5813,307 @@ async fn delete_request_body_is_ignored_to_match_python_router() {
     );
 }
 
+
+// ============ 商业化双上游路由(commercial router)集成测试 ============
+
+fn write_commercial_profile(
+    profile_dir: &std::path::Path,
+    block_threshold: f64,
+    divert_threshold: f64,
+) {
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": "http://127.0.0.1:9/v1",
+                "model": "unused-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 1,
+                "max_retries": 0
+            },
+            "prompt": {"template_file": "ai_prompt.txt", "max_text_length": 4000},
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            },
+            "oneclass": {
+                "block_threshold": block_threshold,
+                "divert_threshold": divert_threshold,
+                "review_base_rate": 0.0
+            }
+        })
+        .to_string(),
+    )
+    .expect("write commercial profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
+}
+
+fn write_minimal_oneclass_model(profile_dir: &std::path::Path) {
+    std::fs::write(
+        profile_dir.join("oneclass_model.json"),
+        json!({
+            "runtime_version": 1,
+            "window_chars": 8,
+            "ngram_range": [2, 4],
+            "n_features": 1024,
+            "lowercase": true,
+            "alternate_sign": false,
+            "centroid": {"0": 1.0}
+        })
+        .to_string(),
+    )
+    .expect("write oneclass model");
+}
+
+async fn post_commercial_request(
+    proxy_base: &str,
+    config: &str,
+    upstream_base: &str,
+) -> reqwest::Response {
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "commercial routing probe"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response")
+}
+
+#[tokio::test]
+async fn commercial_router_shadow_mode_marks_divert_but_stays_on_primary() {
+    let profile_name = format!("commercial-shadow-{}-{}", std::process::id(), unique_test_suffix());
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
+    // 任意分数必落存疑区间: block < score < divert
+    write_commercial_profile(&profile_dir, -100.0, 100.0);
+    write_minimal_oneclass_model(&profile_dir);
+
+    let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
+    let dead_secondary = unused_http_base();
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {"enabled": true, "profile": profile_name},
+            "router": {
+                "secondary_upstream": format!("{dead_secondary}/v1/chat/completions")
+            }
+            // shadow_mode 缺省 = true
+        })
+        .to_string(),
+    );
+
+    let response = post_commercial_request(&proxy_base, &config, &primary_base).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-route")
+            .and_then(|value| value.to_str().ok()),
+        Some("shadow-secondary")
+    );
+    // 影子模式实际仍走主上游
+    let seen = primary_seen.lock().expect("primary seen lock");
+    assert_eq!(seen.len(), 1, "shadow mode must not leave primary upstream");
+}
+
+#[tokio::test]
+async fn commercial_router_divert_routes_to_secondary_when_shadow_off() {
+    let profile_name = format!("commercial-divert-{}-{}", std::process::id(), unique_test_suffix());
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
+    write_commercial_profile(&profile_dir, -100.0, 100.0);
+    write_minimal_oneclass_model(&profile_dir);
+
+    let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
+    let (secondary_base, secondary_seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {"enabled": true, "profile": profile_name},
+            "router": {
+                "secondary_upstream": format!("{secondary_base}/v1/chat/completions"),
+                "shadow_mode": false
+            }
+        })
+        .to_string(),
+    );
+
+    let response = post_commercial_request(&proxy_base, &config, &primary_base).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-route")
+            .and_then(|value| value.to_str().ok()),
+        Some("secondary")
+    );
+    assert!(secondary_seen.lock().expect("secondary seen").len() >= 1);
+    assert_eq!(
+        primary_seen.lock().expect("primary seen").len(),
+        0,
+        "non-shadow divert must leave primary untouched"
+    );
+}
+
+#[tokio::test]
+async fn commercial_router_secondary_failure_falls_back_to_primary() {
+    let profile_name =
+        format!("commercial-fallback-{}-{}", std::process::id(), unique_test_suffix());
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
+    write_commercial_profile(&profile_dir, -100.0, 100.0);
+    write_minimal_oneclass_model(&profile_dir);
+
+    let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
+    let dead_secondary = unused_http_base();
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {"enabled": true, "profile": profile_name},
+            "router": {
+                "secondary_upstream": format!("{dead_secondary}/v1/chat/completions"),
+                "shadow_mode": false
+            }
+        })
+        .to_string(),
+    );
+
+    let response = post_commercial_request(&proxy_base, &config, &primary_base).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-route")
+            .and_then(|value| value.to_str().ok()),
+        Some("secondary-fallback-primary")
+    );
+    assert!(primary_seen.lock().expect("primary seen").len() >= 1);
+}
+
+#[tokio::test]
+async fn commercial_router_blocks_extreme_score_with_route_header() {
+    let profile_name = format!("commercial-block-{}-{}", std::process::id(), unique_test_suffix());
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
+    // block_threshold=100 → 任何分数都低于线 → 拦截
+    write_commercial_profile(&profile_dir, 100.0, 200.0);
+    write_minimal_oneclass_model(&profile_dir);
+
+    let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {"enabled": true, "profile": profile_name},
+            "router": {"shadow_mode": false}
+        })
+        .to_string(),
+    );
+
+    let response = post_commercial_request(&proxy_base, &config, &primary_base).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-route")
+            .and_then(|value| value.to_str().ok()),
+        Some("blocked")
+    );
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
+    assert!(
+        body["error"].get("moderation_details").is_none(),
+        "moderation_details must not be exposed to callers"
+    );
+    assert!(primary_seen.lock().expect("primary seen").is_empty());
+}
+
+#[tokio::test]
+async fn commercial_router_degrades_to_legacy_chain_without_oneclass_model() {
+    let _llm_gate = llm_test_gate().lock().expect("llm test gate");
+    let profile_name = format!("commercial-degrade-{}-{}", std::process::id(), unique_test_suffix());
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
+    // 不写 oneclass_model.json → route_moderation 返回 None → 走现状决策链。
+    // 现状链无本地模型时必走 LLM 复核:配一个判干净的 LLM mock
+    let (llm_base, _hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": false, \"category\": null, \"reason\": \"clean\"}"
+            }
+        }]
+    }))
+    .await;
+    write_commercial_profile(&profile_dir, -100.0, 100.0);
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {"template_file": "ai_prompt.txt", "max_text_length": 4000},
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            },
+            "oneclass": {"block_threshold": -100.0, "divert_threshold": 100.0}
+        })
+        .to_string(),
+    )
+    .expect("write degrade profile");
+
+    let (primary_base, primary_seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {"enabled": true, "profile": profile_name},
+            "router": {"shadow_mode": false}
+        })
+        .to_string(),
+    );
+
+    let response = post_commercial_request(&proxy_base, &config, &primary_base).await;
+
+    // 现状链:本地模型缺失 → LLM 复核判干净 → 放行主上游
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-route")
+            .and_then(|value| value.to_str().ok()),
+        Some("primary")
+    );
+    assert!(primary_seen.lock().expect("primary seen").len() >= 1);
+}
+
 async fn spawn_upstream_echo_server() -> (String, Arc<Mutex<Vec<SeenRequest>>>) {
     let state = UpstreamState {
         seen: Arc::new(Mutex::new(Vec::new())),

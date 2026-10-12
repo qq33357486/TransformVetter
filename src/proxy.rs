@@ -39,6 +39,111 @@ const HEADER_DENYLIST: &[&str] = &[
 
 const MIN_VALID_RESPONSE_CHARS: usize = 1;
 
+/// 双上游路由配置(来自 ENV_KEY 渠道配置 JSON 的 "router" 段)。
+/// 影子模式默认开启:灰度期只加响应头/日志,不真正切流。
+#[derive(Debug, Clone)]
+struct RouterConfig {
+    /// 可选:覆盖 URL 尾部编码的主上游。
+    primary_upstream: Option<String>,
+    /// 存疑(中置信)流量走次级上游;未配置则存疑也走主上游。
+    secondary_upstream: Option<String>,
+    /// 影子模式:存疑只打标(x-prismguard-route: shadow-secondary),实际仍走主上游。
+    shadow_mode: bool,
+    /// 次级上游失败(传输错误/5xx)时回退主上游(可用性优先)。
+    fallback_to_primary: bool,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            primary_upstream: None,
+            secondary_upstream: None,
+            shadow_mode: true,
+            fallback_to_primary: true,
+        }
+    }
+}
+
+impl RouterConfig {
+    fn from_config_value(config: &Value) -> Self {
+        let Some(router) = config.get("router").and_then(Value::as_object) else {
+            return Self::default();
+        };
+        let defaults = Self::default();
+        Self {
+            primary_upstream: router
+                .get("primary_upstream")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            secondary_upstream: router
+                .get("secondary_upstream")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            shadow_mode: router
+                .get("shadow_mode")
+                .and_then(Value::as_bool)
+                .unwrap_or(defaults.shadow_mode),
+            fallback_to_primary: router
+                .get("fallback_to_primary")
+                .and_then(Value::as_bool)
+                .unwrap_or(defaults.fallback_to_primary),
+        }
+    }
+}
+
+/// 上游目标:base(scheme://host[:port]) + 路径前缀 + query。
+#[derive(Debug, Clone)]
+struct UpstreamTarget {
+    base: String,
+    path: String,
+    query: Option<String>,
+}
+
+fn parse_upstream_target(raw: &str) -> Result<UpstreamTarget, ApiError> {
+    let upstream = reqwest::Url::parse(raw).map_err(|e| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("invalid upstream url: {e}"),
+        )
+        .with_code("CONFIG_PARSE_ERROR")
+        .with_error_type("config_error")
+    })?;
+    let host = upstream.host_str().ok_or_else(|| {
+        ApiError::new(StatusCode::BAD_REQUEST, "upstream host is missing")
+            .with_code("CONFIG_PARSE_ERROR")
+            .with_error_type("config_error")
+    })?;
+    let base = match upstream.port() {
+        Some(port) => format!("{}://{}:{}", upstream.scheme(), host, port),
+        None => format!("{}://{}", upstream.scheme(), host),
+    };
+    Ok(UpstreamTarget {
+        base,
+        path: if upstream.path().is_empty() {
+            "/".to_string()
+        } else {
+            upstream.path().to_string()
+        },
+        query: upstream.query().map(str::to_string),
+    })
+}
+
+/// 路由结果标签(响应头 x-prismguard-route 的值,也进日志)。
+const ROUTE_HEADER: &str = "x-prismguard-route";
+const ROUTE_BLOCKED: &str = "blocked";
+const ROUTE_PRIMARY: &str = "primary";
+const ROUTE_SECONDARY: &str = "secondary";
+const ROUTE_SHADOW_SECONDARY: &str = "shadow-secondary";
+const ROUTE_SECONDARY_FALLBACK: &str = "secondary-fallback-primary";
+
+fn route_header(label: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(label) {
+        headers.insert(HeaderName::from_static(ROUTE_HEADER), value);
+    }
+    headers
+}
+
 pub async fn proxy_entry(
     State(state): State<AppState>,
     Path(cfg_and_upstream): Path<String>,
@@ -60,30 +165,18 @@ async fn proxy_entry_with_cfg(
     request: Request<Body>,
 ) -> Result<Response, ApiError> {
     let parsed = parse_url_config(&state.settings, &cfg_and_upstream)?;
-    let upstream = reqwest::Url::parse(&parsed.upstream).map_err(|e| {
-        ApiError::new(
-            StatusCode::BAD_REQUEST,
-            format!("invalid upstream url: {e}"),
-        )
-        .with_code("CONFIG_PARSE_ERROR")
-        .with_error_type("config_error")
-    })?;
+    let router_cfg = RouterConfig::from_config_value(&parsed.config);
 
-    let upstream_host = upstream.host_str().ok_or_else(|| {
-        ApiError::new(StatusCode::BAD_REQUEST, "upstream host is missing")
-            .with_code("CONFIG_PARSE_ERROR")
-            .with_error_type("config_error")
-    })?;
-    let upstream_base = match upstream.port() {
-        Some(port) => format!("{}://{}:{}", upstream.scheme(), upstream_host, port),
-        None => format!("{}://{}", upstream.scheme(), upstream_host),
-    };
-    let path = if upstream.path().is_empty() {
-        "/".to_string()
-    } else {
-        upstream.path().to_string()
-    };
-    let query = upstream.query().map(str::to_string);
+    // 主上游:router.primary_upstream(若配置)优先,否则 URL 尾部编码的上游
+    let primary_target = parse_upstream_target(
+        router_cfg
+            .primary_upstream
+            .as_deref()
+            .unwrap_or(&parsed.upstream),
+    )?;
+    let upstream_base = primary_target.base.clone();
+    let path = primary_target.path.clone();
+    let query = primary_target.query.clone();
 
     let (parts, body) = request.into_parts();
     let raw_body = to_bytes(body).await.map_err(|e| {
@@ -165,70 +258,161 @@ async fn proxy_entry_with_cfg(
                 blocked.reason,
                 Some(moderation_format.as_str()),
                 None,
-            ));
+            )
+            .with_extra_headers(route_header(ROUTE_BLOCKED)));
         }
     }
+    // 三态路由决策(oneclass 可用时接管 smart 层;不可用降级为现状决策链)
+    let mut route_label: &'static str = ROUTE_PRIMARY;
+    let mut divert_to_secondary = false;
     if smart_mod_enabled {
         let (moderation_format, moderation_text) = moderation_context
             .as_ref()
             .expect("moderation context when smart moderation enabled");
-        match smart::smart_moderation(
+        let model_name = request_plan
+            .body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let routed = smart::route_moderation(
             moderation_text,
+            &model_name,
             &smart_mod_cfg,
             &state.settings.root_dir,
             &state.http_client,
             &state.settings.env_map,
         )
-        .await
-        {
-            Ok(Some(result)) if result.violation => {
-                moderation_debug = moderation_debug_headers(result.debug.as_ref());
-                // 响应体不带 moderation_details(信息最小化);详情已由
-                // smart_moderation_error_message 记入服务端日志
-                return Err(ApiError::moderation_blocked(
-                    smart_moderation_error_message(&result),
-                    Some(moderation_format.as_str()),
-                    None,
+        .await;
+        match routed {
+            Ok(Some(decision)) => {
+                moderation_debug = moderation_debug_headers(Some(&decision.debug));
+                match decision.route {
+                    smart::ModerationRoute::Block => {
+                        // 分数拦截:详情进服务端日志,对外统一文案
+                        tracing::info!(
+                            route = smart::ModerationRoute::Block.as_str(),
+                            model = %decision.model_name,
+                            score = decision.score,
+                            raw_score = decision.raw_score,
+                            baseline_group = %decision.baseline_group,
+                            llm_reviewed = decision.llm_reviewed,
+                            "commercial router blocked request"
+                        );
+                        let mut headers = moderation_debug.clone();
+                        append_extra_headers(&mut headers, &route_header(ROUTE_BLOCKED));
+                        return Err(ApiError::moderation_blocked(
+                            crate::moderation::MODERATION_BLOCKED_MESSAGE,
+                            Some(moderation_format.as_str()),
+                            None,
+                        )
+                        .with_extra_headers(headers));
+                    }
+                    smart::ModerationRoute::Divert => {
+                        let secondary_ready = router_cfg
+                            .secondary_upstream
+                            .as_deref()
+                            .and_then(|raw| parse_upstream_target(raw).ok())
+                            .is_some();
+                        if !secondary_ready {
+                            // 未配置(或非法)次级上游:可用性优先,走主上游
+                            route_label = ROUTE_PRIMARY;
+                        } else if router_cfg.shadow_mode {
+                            // 影子模式:只打标,实际仍走主上游(灰度安全机制)
+                            route_label = ROUTE_SHADOW_SECONDARY;
+                        } else {
+                            route_label = ROUTE_SECONDARY;
+                            divert_to_secondary = true;
+                        }
+                    }
+                    smart::ModerationRoute::Allow => {
+                        route_label = ROUTE_PRIMARY;
+                    }
+                }
+            }
+            // oneclass 不可用 → 降级为现状决策链
+            Ok(None) => {
+                match smart::smart_moderation(
+                    moderation_text,
+                    &smart_mod_cfg,
+                    &state.settings.root_dir,
+                    &state.http_client,
+                    &state.settings.env_map,
                 )
-                .with_extra_headers(moderation_debug));
+                .await
+                {
+                    Ok(Some(result)) if result.violation => {
+                        moderation_debug = moderation_debug_headers(result.debug.as_ref());
+                        // 响应体不带 moderation_details(信息最小化);详情已由
+                        // smart_moderation_error_message 记入服务端日志
+                        let mut headers = moderation_debug.clone();
+                        append_extra_headers(&mut headers, &route_header(ROUTE_BLOCKED));
+                        return Err(ApiError::moderation_blocked(
+                            smart_moderation_error_message(&result),
+                            Some(moderation_format.as_str()),
+                            None,
+                        )
+                        .with_extra_headers(headers));
+                    }
+                    Ok(Some(result)) => {
+                        moderation_debug = moderation_debug_headers(result.debug.as_ref());
+                    }
+                    Ok(None) => {}
+                    Err(smart::SmartModerationError::ConcurrencyLimit(message)) => {
+                        let mut debug = HeaderMap::new();
+                        debug.insert(
+                            HeaderName::from_static("x-prismguard-llm-reviewed"),
+                            HeaderValue::from_static("true"),
+                        );
+                        debug.insert(
+                            HeaderName::from_static("x-prismguard-llm-result"),
+                            HeaderValue::from_static("error"),
+                        );
+                        append_extra_headers(&mut debug, &route_header(ROUTE_BLOCKED));
+                        return Err(ApiError::moderation_blocked(
+                            message,
+                            Some(moderation_format.as_str()),
+                            Some(json!({
+                                "source": "concurrency_limit"
+                            })),
+                        )
+                        .with_extra_headers(debug));
+                    }
+                    Err(smart::SmartModerationError::Other(err, debug)) => {
+                        return Err(ApiError::from(err)
+                            .with_extra_headers(moderation_debug_headers(debug.as_ref())));
+                    }
+                }
             }
-            Ok(Some(result)) => {
-                moderation_debug = moderation_debug_headers(result.debug.as_ref());
-            }
-            Ok(None) => {}
-            Err(smart::SmartModerationError::ConcurrencyLimit(message)) => {
-                let mut debug = HeaderMap::new();
-                debug.insert(
-                    HeaderName::from_static("x-prismguard-llm-reviewed"),
-                    HeaderValue::from_static("true"),
-                );
-                debug.insert(
-                    HeaderName::from_static("x-prismguard-llm-result"),
-                    HeaderValue::from_static("error"),
-                );
-                return Err(ApiError::moderation_blocked(
-                    message,
-                    Some(moderation_format.as_str()),
-                    Some(json!({
-                        "source": "concurrency_limit"
-                    })),
-                )
-                .with_extra_headers(debug));
-            }
-            Err(smart::SmartModerationError::Other(err, debug)) => {
-                return Err(ApiError::from(err)
-                    .with_extra_headers(moderation_debug_headers(debug.as_ref())));
-            }
+            Err(err) => return Err(map_route_error(err, moderation_format.as_str())),
         }
     }
     let is_stream = request_plan.stream;
-    let final_url = build_upstream_url(
+    let primary_url = build_upstream_url(
         &upstream_base,
         &request_plan.path,
         query.as_deref(),
         request_plan.target_format,
         is_stream,
     );
+    let secondary_target = if divert_to_secondary {
+        router_cfg
+            .secondary_upstream
+            .as_deref()
+            .and_then(|raw| parse_upstream_target(raw).ok())
+    } else {
+        None
+    };
+    let secondary_url = secondary_target.as_ref().map(|target| {
+        build_upstream_url(
+            &target.base,
+            &request_plan.path,
+            target.query.as_deref().or(query.as_deref()),
+            request_plan.target_format,
+            is_stream,
+        )
+    });
+    let final_url = secondary_url.clone().unwrap_or(primary_url.clone());
     request_body = request_plan.body;
     let forward_planned_json = should_forward_planned_json(&parts.method);
     let passthrough_raw_body = if request_plan.passthrough {
@@ -237,43 +421,89 @@ async fn proxy_entry_with_cfg(
         None
     };
 
-    let mut upstream_request = state
-        .http_client
-        .request(
-            parts.method
-                .as_str()
-                .parse()
-                .expect("valid request method"),
-            final_url,
-        )
-        .headers(filtered_request_headers(
-            &parts.headers,
-            forward_planned_json,
-        ));
-
-    if let Some(passthrough_raw_body) = passthrough_raw_body {
-        upstream_request = upstream_request.body(passthrough_raw_body);
+    // 预构建请求体字节,次级失败回退主上游时需要重放
+    let upstream_body: Option<Vec<u8>> = if let Some(passthrough_raw_body) = passthrough_raw_body {
+        Some(passthrough_raw_body)
     } else if forward_planned_json {
-        upstream_request =
-            upstream_request.body(serde_json::to_vec(&request_body).map_err(|e| {
-                ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    format!("failed to encode transformed body: {e}"),
-                )
-                .with_code("PROXY_ERROR")
-            })?);
+        Some(serde_json::to_vec(&request_body).map_err(|e| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("failed to encode transformed body: {e}"),
+            )
+            .with_code("PROXY_ERROR")
+        })?)
     } else if !raw_body.is_empty() {
-        upstream_request = upstream_request.body(raw_body.clone());
-    }
+        Some(raw_body.to_vec())
+    } else {
+        None
+    };
 
-    let upstream_response = upstream_request.send().await.map_err(|e| {
-        ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            format!("upstream request failed: {e}"),
-        )
-        .with_code("PROXY_ERROR")
-        .with_error_type("proxy_error")
-    })?;
+    let send_upstream = |url: String, body: Option<Vec<u8>>| {
+        let mut upstream_request = state
+            .http_client
+            .request(
+                parts.method.as_str().parse().expect("valid request method"),
+                url,
+            )
+            .headers(filtered_request_headers(&parts.headers, forward_planned_json));
+        if let Some(body) = body {
+            upstream_request = upstream_request.body(body);
+        }
+        upstream_request.send()
+    };
+
+    let mut upstream_response = {
+        match send_upstream(final_url, upstream_body.clone()).await {
+            Ok(response) => response,
+            Err(err) => {
+                if divert_to_secondary && router_cfg.fallback_to_primary {
+                    // 次级上游传输失败:回退主上游(可用性优先,风险由采样审计兜底)
+                    tracing::warn!(
+                        error = %err,
+                        "secondary upstream failed; falling back to primary"
+                    );
+                    route_label = ROUTE_SECONDARY_FALLBACK;
+                    send_upstream(primary_url.clone(), upstream_body.clone()).await.map_err(|e| {
+                        ApiError::new(
+                            StatusCode::BAD_GATEWAY,
+                            format!("upstream request failed: {e}"),
+                        )
+                        .with_code("PROXY_ERROR")
+                        .with_error_type("proxy_error")
+                    })?
+                } else {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_GATEWAY,
+                        format!("upstream request failed: {err}"),
+                    )
+                    .with_code("PROXY_ERROR")
+                    .with_error_type("proxy_error"));
+                }
+            }
+        }
+    };
+
+    // 次级上游返回 5xx 同样视为失败:回退主上游重放
+    if divert_to_secondary
+        && router_cfg.fallback_to_primary
+        && upstream_response.status().is_server_error()
+    {
+        tracing::warn!(
+            status = upstream_response.status().as_u16(),
+            "secondary upstream returned 5xx; falling back to primary"
+        );
+        route_label = ROUTE_SECONDARY_FALLBACK;
+        upstream_response = send_upstream(primary_url.clone(), upstream_body.clone())
+            .await
+            .map_err(|e| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("upstream request failed: {e}"),
+            )
+            .with_code("PROXY_ERROR")
+            .with_error_type("proxy_error")
+        })?;
+    }
 
     tracing::info!(
         method = %parts.method,
@@ -283,6 +513,7 @@ async fn proxy_entry_with_cfg(
         src_format = request_plan.source_format.map(|f| f.as_str()).unwrap_or("unknown"),
         target_format = request_plan.target_format.map(|f| f.as_str()).unwrap_or("none"),
         status = upstream_response.status().as_u16(),
+        route = route_label,
         config_source = %parsed.source,
         "proxied request"
     );
@@ -295,6 +526,10 @@ async fn proxy_entry_with_cfg(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    // 路由标签头随响应返回(含影子模式标记),便于灰度观测
+    let mut response_extra_headers = moderation_debug;
+    append_extra_headers(&mut response_extra_headers, &route_header(route_label));
+
     build_proxy_response(
         upstream_response,
         request_plan.source_format,
@@ -303,9 +538,22 @@ async fn proxy_entry_with_cfg(
         delay_stream_header,
         is_stream,
         estimated_prompt_tokens,
-        &moderation_debug,
+        &response_extra_headers,
     )
     .await
+}
+
+/// 三态决策链的错误映射(复核失败已在决策层吞掉,这里只剩配置类错误)。
+fn map_route_error(err: smart::SmartModerationError, _source_format: &str) -> ApiError {
+    match err {
+        smart::SmartModerationError::ConcurrencyLimit(message) => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            message,
+        )
+        .with_code("MODERATION_RATE_LIMITED")
+        .with_error_type("moderation_error"),
+        smart::SmartModerationError::Other(error, _debug) => ApiError::from(error),
+    }
 }
 
 fn parse_request_json(
