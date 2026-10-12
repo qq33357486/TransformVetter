@@ -14,8 +14,8 @@
   "probability": {
     "ai_review_rate": 0.05,
     "random_seed": 42,
-    "low_risk_threshold": 0.60,
-    "high_risk_threshold": 0.80,
+    "low_risk_threshold": 0.6,
+    "high_risk_threshold": 0.8,
     "enable_concurrency_limit_fallback": true
   },
   "local_model_type": "hashlinear",
@@ -26,11 +26,24 @@
     "max_db_items": 100000,
     "sample_loading": "random_duplicate",
     "analyzer": "char",
-    "ngram_range": [2, 4],
+    "ngram_range": [
+      2,
+      4
+    ],
     "n_features": 1048576,
-    "alpha": 0.00001,
+    "alpha": 1e-05,
     "epochs": 2,
     "batch_size": 2048,
     "max_seconds": 300
+  },
+  "oneclass": {
+    "block_threshold": -0.0001374208222841844,
+    "divert_threshold": -0.008001511357724657,
+    "review_base_rate": 1.0,
+    "review_forced_model_prefixes": [],
+    "review_violation_block_conf": 0.85,
+    "review_cleared_gray_conf": 0.8,
+    "review_unparseable_policy": "self",
+    "baselines": []
   }
 }

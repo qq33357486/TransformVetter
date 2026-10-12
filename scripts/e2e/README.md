@@ -40,7 +40,7 @@ TV_IMAGE=ghcr.io/qq33357486/transformvetter:deploy-harden bash scripts/e2e/run_e
 - 预检:TV_IMAGE 存在、curl/gzip/docker 可用、18000/18001/18002 端口空闲、仓库 `configs/` 文件齐全。
 - 被测容器:`docker run -d --name tv-e2e -p 127.0.0.1:18000:8000 --add-host=host.docker.internal:host-gateway -v /tmp/tv-e2e/configs:/app/configs --env-file /tmp/tv-e2e/.env --cpus 1 --memory 768m $TV_IMAGE`,healthz 重试 30 次等就绪。
 - 复核 profile(`configs/mod_profiles/e2e/`)由 default 复制改造:`ai.base_url` 指向 mock 复核端点、假 key、`timeout=10`、`max_retries=0`、阈值 0.30/0.50;**不放置任何本地模型文件**,因此所有请求都走 LLM 复核链路,且全程不做训练(`TRAINING_SCHEDULER_ENABLED=false`)。
-- 三态路由 profile(`configs/mod_profiles/e2e-router/`)由脚本内嵌的 `gen_oneclass.py` 生成:玩具 oneclass 模型(质心=正常文本 gram 计数方向)+ 按模型名前缀的基线表,把三份探针(纯异质/混合/正常文本)的归一化分数精确放进 拦截(-1.0)/存疑(-0.25)/合规(+0.5) 三档。murmur3 与 `hashlinear.rs` 经参考向量逐位锁定(`hashlinear.rs` 的 `murmur3_reference_vectors_cover_all_tail_lengths` 测试)。
+- 三态路由 profile(`configs/mod_profiles/e2e-router/`)由脚本内嵌的 `gen_oneclass.py` 生成:玩具 oneclass 模型(质心=正常文本 gram 计数方向;打分与生产同式:小写→≥2 连续空白折叠→char 2-4 gram→TF·单位质心相似度→anomaly=-min(sim))+ 按模型名前缀的基线表(p50/p95,异常分取向),把三份探针(纯异质/混合/正常文本)的归一化分精确放进 拦截(+1.0)/存疑(+0.25)/合规(-0.5) 三档(阈值 block=0.5/divert=0.0)。murmur3 与 `hashlinear.rs` 经参考向量逐位锁定(`hashlinear.rs` 的 `murmur3_reference_vectors_cover_all_tail_lengths` 测试)。
 
 ## 用例表
 

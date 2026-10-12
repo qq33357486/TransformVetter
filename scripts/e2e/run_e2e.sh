@@ -462,11 +462,12 @@ ASSERT_EOF
 
 复刻 src/moderation/oneclass.rs 的推理:char 2-4 gram murmur3 哈希计数
 (与 hashlinear.rs 的 murmurhash3_x86_32 逐位一致,含 i32 unsigned_abs
-取模语义)、L2 归一质心、非重叠滑窗取最小余弦。据此把三份探针的原始分
-经基线表(p05/p50,span=0.1)精确归一化到:
-  block  probe -> normalized = -1.0  (< -0.5 拦截线)
-  divert probe -> normalized = -0.25 ([-0.5, 0.0) 存疑线)
-  allow  probe -> normalized = +0.5  (>= 0.0 合规线)
+取模语义)、L2 归一质心、非重叠滑窗按 TF·质心相似度取最异常窗,
+anomaly = -min(sim),分母只统计质心桶上的计数,退化窗(tf=0)排除。
+据此把三份探针的异常分经基线表(p50/p95,span=0.1)归一化到:
+  block  probe -> normalized = +1.0  (> 0.5 拦截线)
+  divert probe -> normalized = +0.25 ((0.0, 0.5] 存疑档)
+  allow  probe -> normalized = -0.5  (<= 0.0 合规线)
 用法: gen_oneclass.py <profile_dir> <probe_out_dir>
 """
 import json
@@ -522,8 +523,14 @@ def bucket(gram):
     return abs(signed) % N_FEATURES
 
 
+def collapse_ws_runs(text):
+    r"""复刻 sklearn re.sub(r"\s\s+", " ", t) 与 oneclass.rs collapse_whitespace_runs。"""
+    import re as _re
+    return _re.sub(r"\s\s+", " ", text)
+
+
 def counts_of(text):
-    lowered = text.lower()
+    lowered = collapse_ws_runs(text.lower())
     counts = {}
     top = min(4, len(lowered))
     for n in range(2, top + 1):
@@ -533,30 +540,34 @@ def counts_of(text):
     return counts
 
 
-def cosine(counts, centroid_unit):
+def tf_centroid_sim(counts, centroid_unit):
+    """TF·单位质心相似度(与 oneclass.rs tf_centroid_similarity 一致):
+    分母只统计质心桶上的计数;tf=0 的退化窗返回 None。"""
     dot = 0.0
-    norm_sq = 0.0
+    tf = 0.0
     for idx, value in counts.items():
-        norm_sq += value * value
         weight = centroid_unit.get(idx)
         if weight is not None:
             dot += value * weight
-    norm = norm_sq ** 0.5
-    if norm <= 0.0:
-        return 1.0
-    return dot / norm
+            tf += value
+    if tf <= 0.0:
+        return None
+    return dot / tf
 
 
-def raw_score(text, centroid_unit):
-    """非重叠滑窗取最小余弦(与 oneclass.rs score_windows 一致)。"""
+def raw_anomaly(text, centroid_unit):
+    """非重叠滑窗取最异常窗,anomaly = -min(sim)(与 oneclass.rs 一致);
+    全退化窗按最不异常 -1.0。"""
     chars = list(text)
-    best = None
+    sims = []
     for start in range(0, len(chars), WINDOW_CHARS):
         window = "".join(chars[start:start + WINDOW_CHARS])
-        value = cosine(counts_of(window), centroid_unit)
-        if best is None or value < best:
-            best = value
-    return 1.0 if best is None else best
+        sim = tf_centroid_sim(counts_of(window), centroid_unit)
+        if sim is not None:
+            sims.append(sim)
+    if not sims:
+        return -1.0
+    return -min(sims)
 
 
 def main():
@@ -581,27 +592,28 @@ def main():
             print("probe %s too long: %d" % (name, len(text)), file=sys.stderr)
             sys.exit(1)
 
-    r_allow = raw_score(allow_text, centroid_unit)
-    r_block = raw_score(block_text, centroid_unit)
-    r_divert = raw_score(divert_text, centroid_unit)
-    # 探针分数必须有明确的档位间距,否则夹具失效
-    if not (r_block + 0.15 < r_divert < r_allow - 0.15):
+    a_allow = raw_anomaly(allow_text, centroid_unit)
+    a_block = raw_anomaly(block_text, centroid_unit)
+    a_divert = raw_anomaly(divert_text, centroid_unit)
+    # 探针异常分必须严格保序(越高越异常;三档由各探针专属基线精确放置,
+    # 档位来自 normalized 值而非原始分间距,故只需排序成立 + 小量余量)
+    if not (a_allow + 1e-4 < a_divert < a_block - 1e-4):
         print(
-            "probe scores too close: block=%r divert=%r allow=%r" % (r_block, r_divert, r_allow),
+            "probe anomalies mis-ordered: allow=%r divert=%r block=%r" % (a_allow, a_divert, a_block),
             file=sys.stderr,
         )
         sys.exit(1)
 
     span = 0.1
     baselines = [
-        # p05 = raw + 0.1 -> normalized(raw) = -1.0 < -0.5 → 拦截
-        {"prefix": "e2e-router-block", "p05": r_block + span, "p50": r_block + 2 * span},
-        # p05 = raw + 0.025 -> normalized(raw) = -0.25 ∈ [-0.5, 0) → 存疑
-        {"prefix": "e2e-router-divert", "p05": r_divert + 0.025, "p50": r_divert + 0.125},
-        # p05 = raw - 0.05 -> normalized(raw) = +0.5 >= 0 → 合规
-        {"prefix": "e2e-router-allow", "p05": r_allow - 0.05, "p50": r_allow + 0.05},
-        # 缺省组:任意原始分归一化到 (r+2)/5 ∈ [0.4, 0.6] → 合规
-        {"prefix": "*", "p05": -2.0, "p50": 3.0},
+        # p50 = a_block - 0.1, p95 = a_block → normalized = +1.0 > 0.5 → 拦截
+        {"prefix": "e2e-router-block", "p50": a_block - span, "p95": a_block},
+        # p50 = a_divert - 0.025, p95 = a_divert + 0.075 → normalized = +0.25 ∈ (0.0, 0.5] → 存疑
+        {"prefix": "e2e-router-divert", "p50": a_divert - 0.025, "p95": a_divert + 0.075},
+        # p50 = a_allow + 0.05, p95 = a_allow + 0.15 → normalized = -0.5 <= 0 → 合规
+        {"prefix": "e2e-router-allow", "p50": a_allow + 0.05, "p95": a_allow + 0.15},
+        # 缺省组:任意异常分归一化到 (a-2)/1 ∈ [-3, -1] < 0 → 合规
+        {"prefix": "*", "p50": 2.0, "p95": 3.0},
     ]
 
     model = {
@@ -636,10 +648,13 @@ def main():
         "local_model_type": "hashlinear",
         "oneclass": {
             "model_file": "oneclass_model.json",
-            "block_threshold": -0.5,
+            # anomaly 取向:>block 拦,>divert 存疑
+            "block_threshold": 0.5,
             "divert_threshold": 0.0,
             "review_base_rate": 0.0,
             "review_forced_model_prefixes": [],
+            # e2e 场景沿用"解析失败降级存疑"(生产默认 self,由运营点决定)
+            "review_unparseable_policy": "divert",
             "baselines": baselines,
         },
     }
@@ -669,7 +684,7 @@ def main():
         json.dump(long_body, fh)
 
     print(
-        "gen_oneclass: block=%.4f divert=%.4f allow=%.4f" % (r_block, r_divert, r_allow)
+        "gen_oneclass: block=%.4f divert=%.4f allow=%.4f" % (a_block, a_divert, a_allow)
     )
 
 
