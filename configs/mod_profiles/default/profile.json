@@ -38,7 +38,7 @@
   },
   "oneclass": {
     "block_threshold": -0.0001374208222841844,
-    "divert_threshold": -0.008001511357724657,
+    "divert_threshold": -0.001402411242132043,
     "review_base_rate": 1.0,
     "review_forced_model_prefixes": [],
     "review_violation_block_conf": 0.85,
