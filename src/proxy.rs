@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::pin::Pin;
 
@@ -47,6 +47,12 @@ struct RouterConfig {
     primary_upstream: Option<String>,
     /// 存疑(中置信)流量走次级上游;未配置则存疑也走主上游。
     secondary_upstream: Option<String>,
+    /// divert 转发次级上游时的模型名映射(次级没有同名模型时必需,
+    /// 如 kiro/auto -> claude-sonnet-5-5)。命中才替换;未命中原样转发。
+    secondary_model_map: HashMap<String, String>,
+    /// 次级上游鉴权 key;配置后 divert 请求的 Authorization/x-api-key
+    /// 替换为该值(次级与主上游 key 不同)。回退主上游时恢复原头。
+    secondary_api_key: Option<String>,
     /// 影子模式:存疑只打标(x-prismguard-route: shadow-secondary),实际仍走主上游。
     shadow_mode: bool,
     /// 次级上游失败(传输错误/5xx)时回退主上游(可用性优先)。
@@ -58,6 +64,8 @@ impl Default for RouterConfig {
         Self {
             primary_upstream: None,
             secondary_upstream: None,
+            secondary_model_map: HashMap::new(),
+            secondary_api_key: None,
             shadow_mode: true,
             fallback_to_primary: true,
         }
@@ -70,6 +78,17 @@ impl RouterConfig {
             return Self::default();
         };
         let defaults = Self::default();
+        let secondary_model_map = router
+            .get("secondary_model_map")
+            .and_then(Value::as_object)
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(from, to)| {
+                        to.as_str().map(|to| (from.clone(), to.to_string()))
+                    })
+                    .collect::<HashMap<String, String>>()
+            })
+            .unwrap_or_default();
         Self {
             primary_upstream: router
                 .get("primary_upstream")
@@ -77,6 +96,11 @@ impl RouterConfig {
                 .map(str::to_string),
             secondary_upstream: router
                 .get("secondary_upstream")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            secondary_model_map,
+            secondary_api_key: router
+                .get("secondary_api_key")
                 .and_then(Value::as_str)
                 .map(str::to_string),
             shadow_mode: router
@@ -438,39 +462,85 @@ async fn proxy_entry_with_cfg(
         )
     });
     let final_url = secondary_url.clone().unwrap_or(primary_url.clone());
-    request_body = request_plan.body;
     let forward_planned_json = should_forward_planned_json(&parts.method);
-    let passthrough_raw_body = if request_plan.passthrough {
+    let mut passthrough_raw_body = if request_plan.passthrough {
         decoded_body
     } else {
         None
     };
 
-    // 预构建请求体字节,次级失败回退主上游时需要重放
-    let upstream_body: Option<Vec<u8>> = if let Some(passthrough_raw_body) = passthrough_raw_body {
+    let encode_body = |body: &Value| -> Option<Vec<u8>> {
+        serde_json::to_vec(body).ok()
+    };
+    // 在 move 之前按原始 body 编码主上游重放体(回退主上游始终用原始模型)
+    let primary_planned_body = if forward_planned_json {
+        encode_body(&request_plan.body)
+    } else {
+        None
+    };
+    let primary_body: Option<Vec<u8>> = if let Some(passthrough_raw_body) = passthrough_raw_body {
         Some(passthrough_raw_body)
-    } else if forward_planned_json {
-        Some(serde_json::to_vec(&request_body).map_err(|e| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                format!("failed to encode transformed body: {e}"),
-            )
-            .with_code("PROXY_ERROR")
-        })?)
+    } else if primary_planned_body.is_some() {
+        primary_planned_body
     } else if !raw_body.is_empty() {
         Some(raw_body.to_vec())
     } else {
         None
     };
+    request_body = request_plan.body;
 
-    let send_upstream = |url: String, body: Option<Vec<u8>>| {
+    // divert 且模型命中映射时:次级 body 替换模型名(passthrough 请求改走
+    // 重序列化 JSON,Anthropic JSON 重序列化无损)。
+    let mut secondary_body_map_hit = false;
+    if divert_to_secondary && !router_cfg.secondary_model_map.is_empty() {
+        let current_model = request_body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if let Some(mapped) = router_cfg.secondary_model_map.get(&current_model) {
+            if let Some(obj) = request_body.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    Value::String(mapped.clone()),
+                );
+                secondary_body_map_hit = true;
+                passthrough_raw_body = None;
+                tracing::info!(
+                    from_model = %current_model,
+                    to_model = %mapped,
+                    "divert model remapped for secondary upstream"
+                );
+            }
+        }
+    }
+
+    let secondary_body: Option<Vec<u8>> = if secondary_body_map_hit {
+        encode_body(&request_body)
+    } else {
+        primary_body.clone()
+    };
+
+    let send_upstream = |url: String, body: Option<Vec<u8>>, key_override: Option<&str>| {
+        let mut headers = filtered_request_headers(&parts.headers, forward_planned_json);
+        if let Some(key) = key_override {
+            for header in ["authorization", "x-api-key"] {
+                headers.remove(header);
+            }
+            if let Ok(value) = format!("Bearer {key}").parse() {
+                headers.insert("authorization", value);
+            }
+            if let Ok(value) = key.parse() {
+                headers.insert("x-api-key", value);
+            }
+        }
         let mut upstream_request = state
             .http_client
             .request(
                 parts.method.as_str().parse().expect("valid request method"),
                 url,
             )
-            .headers(filtered_request_headers(&parts.headers, forward_planned_json));
+            .headers(headers);
         if let Some(body) = body {
             upstream_request = upstream_request.body(body);
         }
@@ -478,7 +548,13 @@ async fn proxy_entry_with_cfg(
     };
 
     let mut upstream_response = {
-        match send_upstream(final_url, upstream_body.clone()).await {
+        match send_upstream(
+            final_url,
+            secondary_body,
+            router_cfg.secondary_api_key.as_deref(),
+        )
+        .await
+        {
             Ok(response) => response,
             Err(err) => {
                 if divert_to_secondary && router_cfg.fallback_to_primary {
@@ -488,7 +564,7 @@ async fn proxy_entry_with_cfg(
                         "secondary upstream failed; falling back to primary"
                     );
                     route_label = ROUTE_SECONDARY_FALLBACK;
-                    send_upstream(primary_url.clone(), upstream_body.clone()).await.map_err(|e| {
+                    send_upstream(primary_url.clone(), primary_body.clone(), None).await.map_err(|e| {
                         ApiError::new(
                             StatusCode::BAD_GATEWAY,
                             format!("upstream request failed: {e}"),
@@ -518,7 +594,7 @@ async fn proxy_entry_with_cfg(
             "secondary upstream returned 5xx; falling back to primary"
         );
         route_label = ROUTE_SECONDARY_FALLBACK;
-        upstream_response = send_upstream(primary_url.clone(), upstream_body.clone())
+        upstream_response = send_upstream(primary_url.clone(), primary_body.clone(), None)
             .await
             .map_err(|e| {
             ApiError::new(
