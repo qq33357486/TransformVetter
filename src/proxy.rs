@@ -548,13 +548,13 @@ async fn proxy_entry_with_cfg(
     };
 
     let mut upstream_response = {
-        match send_upstream(
-            final_url,
-            secondary_body,
-            router_cfg.secondary_api_key.as_deref(),
-        )
-        .await
-        {
+        // 鉴权头只在真正发往次级上游时替换;正常请求与回退主上游必须保留原头
+        let key_override = if divert_to_secondary {
+            router_cfg.secondary_api_key.as_deref()
+        } else {
+            None
+        };
+        match send_upstream(final_url, secondary_body, key_override).await {
             Ok(response) => response,
             Err(err) => {
                 if divert_to_secondary && router_cfg.fallback_to_primary {
