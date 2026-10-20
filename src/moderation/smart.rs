@@ -267,11 +267,14 @@ pub async fn route_moderation(
         }));
     }
 
-    if should_review_model(model_name, oneclass_cfg) || keyword_hit {
+    if should_review(model_name, oneclass_cfg, keyword_hit, decision_score) {
         // glm 复核:用截断文本;中段对准 oneclass 最异常窗(score_request
         // 已算出,这里直接复用,不重复打分),让复核优先看到最可疑区段。
-        // keyword_hit=true 时无视采样策略强制送审:词库命中是"必审信号",
-        // 语义判定分得清引用与使用(agent 客户端 prompt 描述攻击特征的场景)。
+        // keyword_hit=true 或灰区分数时无视采样策略强制送审:词库命中是
+        // "必审信号",语义判定分得清引用与使用(agent 客户端 prompt 描述
+        // 攻击特征的场景);灰区(score>divert 线)未送审会被 R4 按分数直接
+        // 引流二级上游,而实测灰区大多是正常客户的边缘形态,必须经过复核的
+        // 高置信豁免捞回,否则降采样运营点的误切率会线性上升。
         let center_hint = score.anomaly_window.map(|(start, end)| (start + end) / 2);
         let truncated = profile.truncate_text_with_center(text, center_hint);
         if let Some(cached) = check_cache(profile_name, &truncated) {
@@ -452,6 +455,21 @@ fn should_review_model(model_name: &str, cfg: &crate::profile::OneClassConfig) -
         return true;
     }
     next_random_unit() < rate
+}
+
+/// 是否送 glm 复核:采样抽中 / 词库命中 / 灰区分数,任一即送审。
+/// 灰区(divert 线 < score ≤ block 线)强制送审:降采样运营点下,未送审的
+/// 灰区流量会被 R4 按分数直接引流二级上游,而实测灰区大部分是正常客户的
+/// 边缘形态,必须经复核的高置信豁免逻辑放行,误切率才不随采样率上升。
+fn should_review(
+    model_name: &str,
+    cfg: &crate::profile::OneClassConfig,
+    keyword_hit: bool,
+    decision_score: f64,
+) -> bool {
+    should_review_model(model_name, cfg)
+        || keyword_hit
+        || decision_score > cfg.divert_threshold
 }
 
 /// 三态边界(规格原文):
@@ -1581,6 +1599,27 @@ mod tests {
         // 采样率 >= 1 全量
         cfg.review_base_rate = 1.0;
         assert!(should_review_model("any-model", &cfg));
+    }
+
+    #[test]
+    fn review_sampling_gray_zone_forces_review_at_zero_rate() {
+        let _random_guard = random_state_lock().lock().expect("random state lock");
+        use super::should_review;
+        use crate::profile::OneClassConfig;
+
+        let mut cfg = OneClassConfig::default();
+        cfg.review_base_rate = 0.0; // 低采样运营点
+        cfg.divert_threshold = -0.0014;
+        cfg.block_threshold = -0.000137;
+
+        // 灰区(divert < score < block):采样率为 0 也必须送审
+        assert!(should_review("gpt-6.1-sol", &cfg, false, -0.0005));
+        // 正常带(score <= divert)且无词库命中:采样率 0 不送审
+        assert!(!should_review("gpt-6.1-sol", &cfg, false, -0.01));
+        // 词库命中:无视采样率强制送审
+        assert!(should_review("gpt-6.1-sol", &cfg, true, -0.01));
+        // 恰好等于 divert 线不算灰区(与 route_for_score 的 > 语义一致)
+        assert!(!should_review("gpt-6.1-sol", &cfg, false, -0.0014));
     }
 
     #[test]
