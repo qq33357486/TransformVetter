@@ -159,6 +159,8 @@ const ROUTE_PRIMARY: &str = "primary";
 const ROUTE_SECONDARY: &str = "secondary";
 const ROUTE_SHADOW_SECONDARY: &str = "shadow-secondary";
 const ROUTE_SECONDARY_FALLBACK: &str = "secondary-fallback-primary";
+/// 客户面文案(2026-10-15 脱敏规范):响应体不携带内部 URL/库错误细节,细节只进服务端日志。
+const UPSTREAM_UNAVAILABLE_MSG: &str = "上游服务暂时不可用，请稍后重试";
 
 fn route_header(label: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -204,7 +206,7 @@ async fn proxy_entry_with_cfg(
 
     let (parts, body) = request.into_parts();
     let raw_body = to_bytes(body).await.map_err(|e| {
-        ApiError::new(StatusCode::BAD_REQUEST, format!("failed to read body: {e}"))
+        ApiError::new(StatusCode::BAD_REQUEST, "请求体读取失败，请重试")
             .with_code("PROXY_ERROR")
     })?;
     let (request_json, decoded_body) =
@@ -565,17 +567,25 @@ async fn proxy_entry_with_cfg(
                     );
                     route_label = ROUTE_SECONDARY_FALLBACK;
                     send_upstream(primary_url.clone(), primary_body.clone(), None).await.map_err(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "primary fallback after secondary failure also failed"
+                        );
                         ApiError::new(
                             StatusCode::BAD_GATEWAY,
-                            format!("upstream request failed: {e}"),
+                            UPSTREAM_UNAVAILABLE_MSG,
                         )
                         .with_code("PROXY_ERROR")
                         .with_error_type("proxy_error")
                     })?
                 } else {
+                    tracing::warn!(
+                        error = %err,
+                        "secondary upstream request failed (no fallback)"
+                    );
                     return Err(ApiError::new(
                         StatusCode::BAD_GATEWAY,
-                        format!("upstream request failed: {err}"),
+                        UPSTREAM_UNAVAILABLE_MSG,
                     )
                     .with_code("PROXY_ERROR")
                     .with_error_type("proxy_error"));
@@ -597,9 +607,13 @@ async fn proxy_entry_with_cfg(
         upstream_response = send_upstream(primary_url.clone(), primary_body.clone(), None)
             .await
             .map_err(|e| {
+            tracing::warn!(
+                error = %e,
+                "primary fallback after secondary 5xx also failed"
+            );
             ApiError::new(
                 StatusCode::BAD_GATEWAY,
-                format!("upstream request failed: {e}"),
+                UPSTREAM_UNAVAILABLE_MSG,
             )
             .with_code("PROXY_ERROR")
             .with_error_type("proxy_error")

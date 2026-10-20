@@ -610,10 +610,10 @@ async fn unreachable_upstream_returns_502_bad_gateway() {
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "PROXY_ERROR");
     assert_eq!(body["error"]["type"], "proxy_error");
-    assert!(body["error"]["message"]
-        .as_str()
-        .expect("error message")
-        .contains("upstream request failed"));
+    // 2026-10-21 脱敏:响应体不再携带库错误原文(含内部 URL),改中文文案
+    let message = body["error"]["message"].as_str().expect("error message");
+    assert!(message.contains("上游服务暂时不可用"), "got: {message}");
+    assert!(!message.contains("://"), "internal url must not leak: {message}");
 }
 
 #[tokio::test]
