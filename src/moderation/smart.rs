@@ -1574,6 +1574,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn review_sampling_forced_prefixes_and_base_rate() {
         let _random_guard = random_state_lock().lock().expect("random state lock");
         use super::should_review_model;
