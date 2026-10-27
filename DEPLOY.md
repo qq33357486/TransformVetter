@@ -94,3 +94,11 @@ docker run -d --name transformvetter \
 - `configs/mod_profiles/default/ai_prompt.txt`:四类判定(破限/违法/色情/蒸馏)+ 降误伤条款
 - `configs/mod_profiles/default/profile.json`:复核模型/阈值/训练参数
 - 生产在服务器 volume 上热改,定期把有效变更回合到本仓库
+
+## 错误脱敏层（2026-10-28，src/error_mask.rs）
+
+- 只针对错误：非 2xx 响应体整段过网；200 流只对结构性错误帧过网，普通内容帧零开销。
+- 规则：邮箱→***@***、URL→[hidden]、裸地址(host:port/IP)→[hidden]、magpie(含所有格)→the gateway。
+- fail-open：非 UTF-8、无命中一律原样放行；总开关环境变量 ERROR_MASK_ENABLED=false 可整体关闭。
+- 生产容器 env 文件在 /soft/transformvetter/tv.env（含 DRAW_MAGPIE profile：生图渠道 68 的纯透传路由，无审核）。
+- 渠道拓扑：new-api 88/89/90(文本) 与 68(生图) 全走 transformvetter:8000/!<PROFILE>$magpie:3425。
