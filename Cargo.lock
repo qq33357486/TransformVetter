@@ -19,6 +19,7 @@ dependencies = [
  "jieba-rs",
  "libc",
  "md5",
+ "regex",
  "reqwest",
  "rocksdb",
  "rusqlite",

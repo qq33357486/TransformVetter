@@ -2,6 +2,8 @@
 
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/error_mask.rs"]
+mod error_mask;
 #[path = "../src/format.rs"]
 mod format;
 #[path = "../src/moderation/mod.rs"]

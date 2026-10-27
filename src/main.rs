@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 
 mod config;
+mod error_mask;
 mod format;
 mod profile;
 mod proxy;

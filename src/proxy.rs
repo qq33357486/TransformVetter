@@ -1022,7 +1022,7 @@ async fn build_streaming_proxy_response(
         return build_response(
             status,
             &response_headers,
-            build_passthrough_stream_body(buffered, upstream),
+            build_passthrough_stream_body(buffered, upstream, true),
         );
     }
 
@@ -1039,7 +1039,7 @@ async fn build_streaming_proxy_response(
             estimated_prompt_tokens,
         )
     } else {
-        build_passthrough_stream_body(buffered, upstream)
+        build_passthrough_stream_body(buffered, upstream, false)
     };
 
     build_response(status, &response_headers, body)
@@ -1156,23 +1156,39 @@ fn build_non_stream_proxy_response_from_body(
         );
     }
 
+    // 错误响应脱敏:非 200 的体一律过网(替换邮箱/地址/产品名,fail-open,
+    // 见 error_mask.rs);200 分支已全部提前 return
+    let mut body = body;
+    if status != StatusCode::OK && crate::error_mask::mask_bytes(&mut body) {
+        tracing::info!(status = status.as_u16(), "masked upstream error body");
+    }
     build_response(status, headers, boxed(Body::from(body)))
 }
 
-fn build_passthrough_stream_body(buffered: Vec<Bytes>, upstream: ReqByteStream) -> BoxBody {
+fn build_passthrough_stream_body(
+    buffered: Vec<Bytes>,
+    upstream: ReqByteStream,
+    mask_errors: bool,
+) -> BoxBody {
     let buffered = VecDeque::from(buffered);
     let stream = stream::unfold(
         (buffered, upstream),
-        |(mut buffered, mut upstream)| async move {
-            if let Some(chunk) = buffered.pop_front() {
-                return Some((Ok::<Bytes, std::io::Error>(chunk), (buffered, upstream)));
-            }
-
-            match upstream.as_mut().next().await {
-                Some(Ok(chunk)) => Some((Ok(chunk), (buffered, upstream))),
-                Some(Err(err)) => Some((Err(stream_read_error(err)), (buffered, upstream))),
-                None => None,
-            }
+        move |(mut buffered, mut upstream)| async move {
+            let chunk = if let Some(chunk) = buffered.pop_front() {
+                chunk
+            } else {
+                match upstream.as_mut().next().await {
+                    Some(Ok(chunk)) => chunk,
+                    Some(Err(err)) => {
+                        return Some((Err(stream_read_error(err)), (buffered, upstream)))
+                    }
+                    None => return None,
+                }
+            };
+            // 错误脱敏层:错误流整段过网;200 流只对结构性错误帧过网,
+            // 普通内容帧零开销原样放行(error_mask.rs)
+            let chunk = crate::error_mask::maybe_mask_chunk(mask_errors, chunk);
+            Some((Ok::<Bytes, std::io::Error>(chunk), (buffered, upstream)))
         },
     );
 
