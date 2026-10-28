@@ -34,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{StatusCode as AxumStatusCode, Uri};
+use axum::http::{HeaderMap, StatusCode as AxumStatusCode, Uri};
 use axum::response::IntoResponse;
 use reqwest::StatusCode;
 use axum::routing::{delete, patch, post};
@@ -54,6 +54,8 @@ struct SeenRequest {
     path: String,
     path_and_query: String,
     json_body: Value,
+    raw_body: Vec<u8>,
+    content_type: Option<String>,
 }
 
 #[derive(Clone)]
@@ -6795,6 +6797,8 @@ async fn upstream_head_echo(State(state): State<UpstreamState>, uri: Uri) -> imp
             .map(|value| value.as_str().to_string())
             .unwrap_or_else(|| uri.path().to_string()),
         json_body: json!({}),
+        raw_body: Vec::new(),
+        content_type: None,
     });
 
     AxumStatusCode::OK
@@ -7062,9 +7066,11 @@ async fn spawn_recording_sequenced_openai_chat_server(
 async fn upstream_echo(
     State(state): State<UpstreamState>,
     uri: Uri,
+    headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let json_body: Value = serde_json::from_slice(&body).expect("json body");
+    // 非 JSON 体(multipart 等)不能让 expect 挂掉:记原文,回包保持 JSON
+    let json_body: Value = serde_json::from_slice(&body).unwrap_or(json!({"non_json": true}));
     state.seen.lock().expect("seen lock").push(SeenRequest {
         path: uri.path().to_string(),
         path_and_query: uri
@@ -7072,9 +7078,14 @@ async fn upstream_echo(
             .map(|value| value.as_str().to_string())
             .unwrap_or_else(|| uri.path().to_string()),
         json_body: json_body.clone(),
+        raw_body: body.to_vec(),
+        content_type: headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
     });
 
-    (AxumStatusCode::OK, Json(json!({"ok": true})))
+    (AxumStatusCode::OK, Json(json!({"ok": true, "received_len": body.len()})))
 }
 
 async fn spawn_proxy_server() -> String {
@@ -7325,4 +7336,60 @@ fn seed_legacy_sqlite_sample_db(
         params![text, label, category, created_at],
     )
     .expect("insert sqlite sample");
+}
+
+// 2026-10-28 回归:透传模式下非 JSON 体(multipart,生图 /v1/images/edits)
+// 曾被误换成计划体的 "{}" 发往上游,触发上游 "multipart: NextPart: EOF"。
+// 现在必须原样转发完整原始字节。
+#[tokio::test]
+async fn passthrough_forwards_non_json_body_verbatim() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+
+    let boundary = "regression-boundary-20261028";
+    let multipart_body = format!(
+        "--{b}\r\ncontent-disposition: form-data; name=\"model\"\r\n\r\ngpt-image-2.5-sunburst\r\n--{b}\r\ncontent-disposition: form-data; name=\"prompt\"\r\n\r\nreview this\r\n--{b}\r\ncontent-disposition: form-data; name=\"image\"; filename=\"a.png\"\r\ncontent-type: application/octet-stream\r\n\r\nPNGfakebytes\r\n--{b}--\r\n",
+        b = boundary
+    )
+    .into_bytes();
+
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": false,
+                "from": "openai_chat",
+                "to": "pass_through",
+                "delay_stream_header": false
+            }
+        })
+        .to_string(),
+    );
+    let upstream_full = format!("{upstream_base}/v1/images/edits");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+        .body(multipart_body.clone())
+        .send()
+        .await
+        .expect("proxy response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/images/edits");
+    assert_eq!(
+        request.raw_body, multipart_body,
+        "multipart body must arrive verbatim"
+    );
+    assert!(request
+        .content_type
+        .as_deref()
+        .unwrap_or_default()
+        .starts_with("multipart/form-data"));
 }

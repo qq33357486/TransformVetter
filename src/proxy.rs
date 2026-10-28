@@ -465,8 +465,21 @@ async fn proxy_entry_with_cfg(
     });
     let final_url = secondary_url.clone().unwrap_or(primary_url.clone());
     let forward_planned_json = should_forward_planned_json(&parts.method);
-    let mut passthrough_raw_body = if request_plan.passthrough {
-        decoded_body
+    // 透传意图按配置判断,不只看 plan.passthrough:body 解不出任何已知格式时
+    // (multipart 等非 JSON,如生图 /v1/images/edits),process_request 会带着
+    // passthrough=false 提前返回,原逻辑会把计划体的空 JSON "{}" 发往上游,
+    // 触发上游 "multipart: NextPart: EOF"(2026-10-28 生图编辑全挂的根因)。
+    // JSON 体的行为与从前逐字节一致(decoded 即原文);非 JSON 体原样转发。
+    let passthrough_intent = parsed
+        .config
+        .get("format_transform")
+        .and_then(|cfg| cfg.get("to"))
+        .and_then(Value::as_str)
+        == Some("pass_through");
+    let mut passthrough_raw_body = if request_plan.passthrough
+        || (passthrough_intent && request_json.is_none() && !raw_body.is_empty())
+    {
+        decoded_body.or_else(|| Some(raw_body.to_vec()))
     } else {
         None
     };
