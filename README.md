@@ -385,6 +385,8 @@ thinking controls, and `parallel_tool_calls: false` is mapped to Claude's
 
 The basic layer loads keywords from a file, matches case-insensitively, and refreshes when the file changes.
 
+Keyword file format: one rule per line; `#` starts a comment line. A line containing `+` separates multiple terms that must ALL appear in the text (AND co-occurrence), e.g. `term one+term two` blocks only when both terms are present. Empty segments around `+` are ignored. A literal `+` inside a single term cannot be expressed.
+
 ### `smart_moderation`
 
 ```json
