@@ -125,6 +125,54 @@ fn basic_moderation_blocks_matching_keyword_case_insensitively() {
 }
 
 #[test]
+fn multi_term_keyword_blocks_only_when_all_terms_present() {
+    let keyword_file = temp_keywords_path("multi-all");
+    std::fs::write(&keyword_file, "alpha phrase+beta phrase\n").expect("write keyword file");
+
+    let cfg = json!({
+        "enabled": true,
+        "keywords_file": keyword_file,
+        "error_code": "BASIC_MODERATION_BLOCKED"
+    });
+
+    let partial = basic::basic_moderation("this mentions ALPHA PHRASE only", &cfg)
+        .expect("partial moderation result");
+    assert!(partial.is_none(), "single term should not trigger AND rule");
+
+    let both = basic::basic_moderation(
+        "alpha PHRASE appears, and later BETA Phrase shows up",
+        &cfg,
+    )
+    .expect("full moderation result");
+    assert!(both.is_some(), "all terms present should trigger");
+
+    let _ = std::fs::remove_file(keyword_file);
+}
+
+#[test]
+fn multi_term_keyword_ignores_empty_segments_and_blank_rules() {
+    let keyword_file = temp_keywords_path("multi-empty");
+    // 连续分隔符产生的空段应被忽略;纯 `+` 行(无有效词)整条丢弃
+    std::fs::write(&keyword_file, "alpha phrase++beta phrase\n+\n").expect("write keyword file");
+
+    let cfg = json!({
+        "enabled": true,
+        "keywords_file": keyword_file,
+        "error_code": "BASIC_MODERATION_BLOCKED"
+    });
+
+    let lone_plus = basic::basic_moderation("a lone + sign in text", &cfg)
+        .expect("lone plus moderation result");
+    assert!(lone_plus.is_none(), "blank rule must be dropped, not always-hit");
+
+    let both = basic::basic_moderation("beta phrase with alpha phrase", &cfg)
+        .expect("both moderation result");
+    assert!(both.is_some(), "empty segments must not break AND matching");
+
+    let _ = std::fs::remove_file(keyword_file);
+}
+
+#[test]
 fn basic_moderation_reloads_keywords_after_file_changes() {
     let keyword_file = temp_keywords_path("reload");
     std::fs::write(&keyword_file, "blocked phrase\n").expect("write keyword file");

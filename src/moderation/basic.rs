@@ -18,7 +18,10 @@ pub struct BasicModerationBlock {
 #[derive(Debug, Clone)]
 struct KeywordPattern {
     original: String,
-    normalized: String,
+    // 归一化词组:1 个=单词(与旧行为一致);≥2 个=AND 共现,全部出现才命中。
+    // 词库格式:一行一个特征,行内 `+` 连接多个词表示共现,如 `词甲+词乙`。
+    // 注意:目标词本身含 `+` 时无法表达(不提供转义)。
+    terms: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +51,7 @@ pub fn basic_moderation(text: &str, cfg: &Value) -> Result<Option<BasicModeratio
     let normalized = text.to_ascii_lowercase();
 
     for kw in patterns {
-        if normalized.contains(&kw.normalized) {
+        if kw.terms.iter().all(|term| normalized.contains(term.as_str())) {
             // 命中词只进服务端日志,不回显给调用方
             info!(keyword = %kw.original, "basic moderation blocked");
             return Ok(Some(BasicModerationBlock {
@@ -76,10 +79,20 @@ fn load_keywords(path: &str) -> Result<Vec<KeywordPattern>> {
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| KeywordPattern {
-                original: line.to_string(),
-                normalized: line.to_ascii_lowercase(),
+            .map(|line| {
+                // 行内 `+` 分隔多词共现;空段(连续分隔符/首尾)忽略,整行无有效词则丢弃
+                let terms: Vec<String> = line
+                    .split('+')
+                    .map(str::trim)
+                    .filter(|term| !term.is_empty())
+                    .map(str::to_ascii_lowercase)
+                    .collect();
+                KeywordPattern {
+                    original: line.to_string(),
+                    terms,
+                }
             })
+            .filter(|kw| !kw.terms.is_empty())
             .collect()
     } else {
         warn!("moderation keywords file not found: {path}");
